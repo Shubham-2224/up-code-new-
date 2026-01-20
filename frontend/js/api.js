@@ -3,7 +3,21 @@
  * Handles all HTTP requests to the Python backend
  */
 
-const API_BASE_URL = 'http://localhost:5000/api';
+// Dynamically determine API URL based on current hostname
+const getAPIBaseURL = () => {
+    const hostname = window.location.hostname;
+    const protocol = window.location.protocol;
+    
+    // If accessed via localhost, use localhost
+    if (hostname === 'localhost' || hostname === '127.0.0.1') {
+        return 'http://localhost:5000/api';
+    }
+    
+    // Otherwise use current hostname (works for AWS public IPs and domains)
+    return `${protocol}//${hostname}:5000/api`;
+};
+
+const API_BASE_URL = getAPIBaseURL();
 
 class API {
     /**
@@ -46,8 +60,14 @@ class API {
      */
     static async detectRegions(fileId, pageNum = 0) {
         try {
+            const hostname = window.location.hostname;
+            const protocol = window.location.protocol;
+            const baseURL = (hostname === 'localhost' || hostname === '127.0.0.1') 
+                ? 'http://localhost:5000' 
+                : `${protocol}//${hostname}:5000`;
+            
             // Get the PDF file from server
-            const pdfPath = `http://localhost:3000/uploads/${fileId}.pdf`;
+            const pdfPath = `${baseURL}/uploads/${fileId}.pdf`;
             
             // Fetch the PDF file
             const pdfResponse = await fetch(pdfPath);
@@ -59,7 +79,7 @@ class API {
             formData.append('pageNum', pageNum.toString());
             formData.append('scale', '2.0');
             
-            const response = await fetch('http://localhost:5000/detect-regions', {
+            const response = await fetch(`${baseURL}/detect-regions`, {
                 method: 'POST',
                 body: formData
             });
@@ -154,7 +174,13 @@ class API {
      */
     static async checkHealth() {
         try {
-            const response = await fetch('http://localhost:5000/health');
+            const hostname = window.location.hostname;
+            const protocol = window.location.protocol;
+            const baseURL = (hostname === 'localhost' || hostname === '127.0.0.1') 
+                ? 'http://localhost:5000' 
+                : `${protocol}//${hostname}:5000`;
+            
+            const response = await fetch(`${baseURL}/health`);
             const data = await response.json();
             return data.status === 'ok';
         } catch (error) {

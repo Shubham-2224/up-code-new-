@@ -197,7 +197,7 @@ fi
 
 # Check if port 5000 is already in use
 echo ""
-echo -e "${BLUE}[5/6]${NC} Checking port 5000..."
+echo -e "${BLUE}[5/7]${NC} Checking port 5000..."
 PORT_IN_USE=false
 PORT_PID=""
 PORT_COMMAND=""
@@ -255,21 +255,72 @@ else
 fi
 
 echo ""
-echo -e "${BLUE}[6/6]${NC} Starting Flask server..."
+echo -e "${BLUE}[6/6]${NC} Detecting IP addresses..."
+
+# Detect private IP
+PRIVATE_IP=$(hostname -I | awk '{print $1}' 2>/dev/null || echo "")
+if [ -z "$PRIVATE_IP" ]; then
+    PRIVATE_IP=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $7}' | head -n1 || echo "")
+fi
+
+# Try to detect public IP (AWS EC2 metadata service)
+PUBLIC_IP=""
+if command -v curl &> /dev/null; then
+    # Try AWS EC2 metadata first (fast for AWS instances)
+    PUBLIC_IP=$(curl -s --connect-timeout 1 http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo "")
+    
+    # If not on AWS, try external service
+    if [ -z "$PUBLIC_IP" ]; then
+        PUBLIC_IP=$(curl -s --connect-timeout 2 https://api.ipify.org 2>/dev/null || echo "")
+    fi
+elif command -v wget &> /dev/null; then
+    # Try AWS EC2 metadata first
+    PUBLIC_IP=$(wget -qO- --timeout=1 http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo "")
+    
+    # If not on AWS, try external service
+    if [ -z "$PUBLIC_IP" ]; then
+        PUBLIC_IP=$(wget -qO- --timeout=2 https://api.ipify.org 2>/dev/null || echo "")
+    fi
+fi
+
+echo ""
+echo -e "${BLUE}[7/7]${NC} Starting Flask server..."
 echo ""
 echo "===================================================="
 echo "   Server Information"
 echo "===================================================="
-echo "Server URL:  http://localhost:5000"
-echo "Frontend:    http://localhost:5000/"
-echo "API Health:  http://localhost:5000/health"
+echo "Local URL:       http://localhost:5000"
+
+if [ ! -z "$PRIVATE_IP" ]; then
+    echo "Private IP:      http://$PRIVATE_IP:5000"
+fi
+
+if [ ! -z "$PUBLIC_IP" ]; then
+    echo -e "${GREEN}Public IP:       http://$PUBLIC_IP:5000${NC}"
+    echo ""
+    echo -e "${YELLOW}👉 Use the Public IP URL to access from your browser!${NC}"
+fi
+
+echo ""
+echo "Frontend:        /index.html (or just /)"
+echo "API Health:      /health"
+echo "Server Info:     /api/server-info"
 echo ""
 echo "===================================================="
 echo "   Instructions"
 echo "===================================================="
 echo "1. Wait for 'Server running on...' message"
-echo "2. Open browser to: http://localhost:5000"
+if [ ! -z "$PUBLIC_IP" ]; then
+    echo "2. Open browser to: http://$PUBLIC_IP:5000"
+else
+    echo "2. Open browser to: http://localhost:5000"
+fi
 echo "3. Press Ctrl+C to stop the server"
+echo ""
+echo "Note: Make sure port 5000 is open in your firewall!"
+if [ ! -z "$PUBLIC_IP" ]; then
+    echo "      (AWS: Add inbound rule for TCP port 5000)"
+fi
 echo "===================================================="
 echo ""
 

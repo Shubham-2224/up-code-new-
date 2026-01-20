@@ -19,7 +19,7 @@ class Config:
     
     # Security
     MAX_CONTENT_LENGTH = int(os.getenv('MAX_FILE_SIZE', 500 * 1024 * 1024))  # 500MB default
-    ALLOWED_ORIGINS = os.getenv('ALLOWED_ORIGINS', 'http://localhost:5000,http://127.0.0.1:5000').split(',')
+    ALLOWED_ORIGINS = os.getenv('ALLOWED_ORIGINS', '*')  # Allow all origins by default for AWS instances
     AUTH_ENABLED = os.getenv('AUTH_ENABLED', 'False').lower() == 'true'
     API_KEYS = set(os.getenv('API_KEYS', '').split(',')) - {''}
     

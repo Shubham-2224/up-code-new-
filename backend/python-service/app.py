@@ -49,9 +49,13 @@ os.environ['GLOG_minloglevel'] = '3'  # Suppress PaddlePaddle C++ logs
 
 app = Flask(__name__)
 
-# FIXED: Restrict CORS to localhost only (change for production)
-ALLOWED_ORIGINS = os.getenv('ALLOWED_ORIGINS', 'http://localhost:5000,http://127.0.0.1:5000').split(',')
-CORS(app, origins=ALLOWED_ORIGINS)
+# CORS Configuration - Allow access from any origin for AWS instances with dynamic IPs
+# For production, set ALLOWED_ORIGINS environment variable to restrict access
+ALLOWED_ORIGINS = os.getenv('ALLOWED_ORIGINS', '*')
+if ALLOWED_ORIGINS == '*':
+    CORS(app, resources={r"/*": {"origins": "*"}})
+else:
+    CORS(app, origins=ALLOWED_ORIGINS.split(','))
 
 # Configuration
 UPLOAD_FOLDER = 'uploads'
@@ -250,6 +254,43 @@ def health():
     if disk_space is not None and disk_space < 100:
         status['warning'] = f'Low disk space: {disk_space:.1f} MB available'
     return jsonify(status)
+
+@app.route('/api/server-info', methods=['GET'])
+def server_info():
+    """Get server information including IP addresses"""
+    import socket
+    import urllib.request
+    
+    info = {
+        'hostname': socket.gethostname(),
+        'private_ip': None,
+        'public_ip': None,
+        'port': 5000
+    }
+    
+    try:
+        # Get private IP (local network IP)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        info['private_ip'] = s.getsockname()[0]
+        s.close()
+    except Exception as e:
+        logger.warning(f"Could not get private IP: {e}")
+    
+    try:
+        # Try to get public IP from AWS metadata service (works on EC2)
+        urllib.request.urlopen('http://169.254.169.254/latest/meta-data/public-ipv4', timeout=1)
+        public_ip = urllib.request.urlopen('http://169.254.169.254/latest/meta-data/public-ipv4', timeout=1).read().decode('utf-8')
+        info['public_ip'] = public_ip
+    except:
+        # If not on AWS or metadata service unavailable, try external service
+        try:
+            public_ip = urllib.request.urlopen('https://api.ipify.org', timeout=2).read().decode('utf-8')
+            info['public_ip'] = public_ip
+        except Exception as e:
+            logger.warning(f"Could not get public IP: {e}")
+    
+    return jsonify(info)
 
 @app.route('/api/cleanup-files', methods=['POST'])
 def cleanup_files_endpoint():
