@@ -9,8 +9,16 @@ Systemd service configuration file.
 - ✅ Auto-detects project location
 - ✅ Runs as your user (not root)
 - ✅ Auto-restart on crash
-- ✅ Proper security settings
+- ✅ Full system PATH (includes tesseract, etc.)
+- ✅ Loads .env file automatically
+- ✅ Proper OCR temp file access
 - ✅ Listens on 0.0.0.0:5000 (accessible from outside)
+
+**Recent Fix (Jan 2026):**
+- ✅ Fixed PATH to include `/usr/bin` for tesseract
+- ✅ Added EnvironmentFile to load .env
+- ✅ Disabled PrivateTmp for OCR temp files
+- ✅ Now extraction works same as manual run!
 
 ### 2. `setup-service.sh`
 One-time setup script to install the systemd service.
@@ -37,6 +45,8 @@ Easy-to-use service management tool.
 - ✅ View logs
 - ✅ Check status
 - ✅ **Show current IP addresses** (important for AWS!)
+- ✅ **Debug mode** - detailed diagnostics
+- ✅ **Test environment** - verify all dependencies
 - ✅ Enable/disable auto-start
 
 **Usage:**
@@ -54,12 +64,27 @@ chmod +x service-manager.sh
 # Check if running
 ./service-manager.sh status
 
+# Full diagnostic (if extraction not working)
+./service-manager.sh debug
+
+# Test all dependencies
+./service-manager.sh test-env
+
 # View logs
 ./service-manager.sh logs
 ```
 
 ### 4. `SERVICE_USAGE.md`
 Complete guide for using the systemd service.
+
+### 5. `EXTRACTION_FIX.md`
+**Important!** Quick guide to fix extraction issues in systemd service.
+
+### 6. `SYSTEMD_TROUBLESHOOTING.md`
+Comprehensive troubleshooting guide for service issues.
+
+### 7. `QUICK_REFERENCE.md`
+Quick command reference card.
 
 ---
 
