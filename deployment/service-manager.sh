@@ -29,6 +29,45 @@ show_help() {
     echo "  enable     - Enable service to start on boot"
     echo "  disable    - Disable service from starting on boot"
     echo "  check      - Check if service is running and port is open"
+    echo "  info       - Show access URLs with current IP addresses"
+    echo ""
+}
+
+show_info() {
+    echo ""
+    echo "Service Information:"
+    echo "==================="
+    
+    # Get IPs
+    PRIVATE_IP=$(hostname -I | awk '{print $1}' 2>/dev/null || echo "")
+    PUBLIC_IP=""
+    
+    if command -v curl &> /dev/null; then
+        PUBLIC_IP=$(curl -s --connect-timeout 1 http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || \
+                    curl -s --connect-timeout 2 https://api.ipify.org 2>/dev/null || echo "")
+    fi
+    
+    echo "Local URL:       http://localhost:5000"
+    if [ ! -z "$PRIVATE_IP" ]; then
+        echo "Private IP:      http://$PRIVATE_IP:5000"
+    fi
+    if [ ! -z "$PUBLIC_IP" ]; then
+        echo -e "${GREEN}Public IP:       http://$PUBLIC_IP:5000${NC}"
+        echo ""
+        echo -e "${YELLOW}👉 Access from browser: http://$PUBLIC_IP:5000${NC}"
+    fi
+    
+    echo ""
+    echo "API Endpoints:"
+    echo "  Health:      /health"
+    echo "  Server Info: /api/server-info"
+    echo ""
+    
+    if sudo systemctl is-active --quiet $SERVICE_NAME; then
+        echo -e "Status: ${GREEN}RUNNING${NC}"
+    else
+        echo -e "Status: ${RED}STOPPED${NC}"
+    fi
     echo ""
 }
 
@@ -91,6 +130,9 @@ case "$1" in
         ;;
     check)
         check_status
+        ;;
+    info)
+        show_info
         ;;
     *)
         show_help

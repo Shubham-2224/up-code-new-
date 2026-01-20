@@ -18,13 +18,16 @@ echo "   Voter Extraction Service Setup"
 echo "===================================================="
 echo ""
 
-# Get the current user
+# Get the current user and auto-detect project root
 CURRENT_USER=$(whoami)
-PROJECT_ROOT="/home/ubuntu/ocr/PythonData_From_data"
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+PROJECT_ROOT="$( cd "$SCRIPT_DIR/.." && pwd )"
 SERVICE_DIR="$PROJECT_ROOT/deployment"
 SERVICE_FILE="$SERVICE_DIR/voter-extraction.service"
 SYSTEMD_DIR="/etc/systemd/system"
 TARGET_SERVICE="$SYSTEMD_DIR/voter-extraction.service"
+
+echo -e "${BLUE}Detected project root: $PROJECT_ROOT${NC}"
 
 # Check if running as root
 if [ "$EUID" -eq 0 ]; then 
@@ -73,13 +76,23 @@ else
 fi
 
 echo ""
-echo -e "${BLUE}[2/6]${NC} Updating service file with current user..."
+echo -e "${BLUE}[2/6]${NC} Updating service file with current user and paths..."
 
-# Create a temporary service file with the actual username
+# Get the actual path dynamically
+ACTUAL_WORKING_DIR="$PROJECT_ROOT/backend/python-service"
+ACTUAL_VENV_BIN="$ACTUAL_WORKING_DIR/venv/bin"
+ACTUAL_PYTHON="$ACTUAL_VENV_BIN/python3"
+
+# Create a temporary service file with the actual values
 TEMP_SERVICE=$(mktemp)
-sed "s|<USERNAME>|$CURRENT_USER|g" "$SERVICE_FILE" > "$TEMP_SERVICE"
+sed "s|<USERNAME>|$CURRENT_USER|g" "$SERVICE_FILE" | \
+sed "s|/home/<USERNAME>/ocr/voter_extraction_without_API|$PROJECT_ROOT|g" | \
+sed "s|/home/$CURRENT_USER/ocr/voter_extraction_without_API|$PROJECT_ROOT|g" > "$TEMP_SERVICE"
 
 echo -e "${GREEN}[OK]${NC} Service file configured"
+echo "  User: $CURRENT_USER"
+echo "  Working Directory: $ACTUAL_WORKING_DIR"
+echo "  Python: $ACTUAL_PYTHON"
 
 echo ""
 echo -e "${BLUE}[3/6]${NC} Installing systemd service..."

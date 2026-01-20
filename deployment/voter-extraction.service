@@ -8,9 +8,9 @@ Type=simple
 # The setup-service.sh script will do this automatically
 User=<USERNAME>
 Group=<USERNAME>
-WorkingDirectory=/home/<USERNAME>/Projects/voter_extraction_without_API/PythonData_From_data/backend/python-service
-Environment="PATH=/home/<USERNAME>/Projects/voter_extraction_without_API/PythonData_From_data/backend/python-service/venv/bin"
-ExecStart=/home/<USERNAME>/Projects/voter_extraction_without_API/PythonData_From_data/backend/python-service/venv/bin/python3 app.py
+WorkingDirectory=/home/<USERNAME>/ocr/voter_extraction_without_API/backend/python-service
+Environment="PATH=/home/<USERNAME>/ocr/voter_extraction_without_API/backend/python-service/venv/bin"
+ExecStart=/home/<USERNAME>/ocr/voter_extraction_without_API/backend/python-service/venv/bin/python3 app.py
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -23,6 +23,10 @@ PrivateTmp=true
 
 # Resource limits (adjust as needed)
 LimitNOFILE=65536
+
+# Environment variables
+Environment="HOST=0.0.0.0"
+Environment="PORT=5000"
 
 [Install]
 WantedBy=multi-user.target
