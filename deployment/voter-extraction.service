@@ -8,9 +8,9 @@ Type=simple
 # The setup-service.sh script will do this automatically
 User=<USERNAME>
 Group=<USERNAME>
-WorkingDirectory=/home/<USERNAME>/Projects/OCR PDF TO EXCEL EXTRACTION/PythonData_From_data/backend/python-service
-Environment="PATH=/home/<USERNAME>/Projects/OCR PDF TO EXCEL EXTRACTION/PythonData_From_data/backend/python-service/venv/bin"
-ExecStart=/home/<USERNAME>/Projects/OCR PDF TO EXCEL EXTRACTION/PythonData_From_data/backend/python-service/venv/bin/python3 app.py
+WorkingDirectory=/home/<USERNAME>/Projects/voter_extraction_without_API/PythonData_From_data/backend/python-service
+Environment="PATH=/home/<USERNAME>/Projects/voter_extraction_without_API/PythonData_From_data/backend/python-service/venv/bin"
+ExecStart=/home/<USERNAME>/Projects/voter_extraction_without_API/PythonData_From_data/backend/python-service/venv/bin/python3 app.py
 Restart=always
 RestartSec=10
 StandardOutput=journal
