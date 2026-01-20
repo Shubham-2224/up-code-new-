@@ -1,0 +1,29 @@
+[Unit]
+Description=Voter Extraction Flask Application
+After=network.target
+
+[Service]
+Type=simple
+# NOTE: Replace <USERNAME> with your actual username when installing
+# The setup-service.sh script will do this automatically
+User=<USERNAME>
+Group=<USERNAME>
+WorkingDirectory=/home/<USERNAME>/Projects/OCR PDF TO EXCEL EXTRACTION/PythonData_From_data/backend/python-service
+Environment="PATH=/home/<USERNAME>/Projects/OCR PDF TO EXCEL EXTRACTION/PythonData_From_data/backend/python-service/venv/bin"
+ExecStart=/home/<USERNAME>/Projects/OCR PDF TO EXCEL EXTRACTION/PythonData_From_data/backend/python-service/venv/bin/python3 app.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=voter-extraction
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Resource limits (adjust as needed)
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+
