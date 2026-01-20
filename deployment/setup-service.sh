@@ -61,6 +61,16 @@ if ! command -v python3 &> /dev/null; then
 fi
 echo -e "${GREEN}[OK]${NC} Python 3 found: $(python3 --version)"
 
+# Check Tesseract (CRITICAL for extraction)
+if ! command -v tesseract &> /dev/null; then
+    echo -e "${RED}ERROR: Tesseract OCR is not installed${NC}"
+    echo "Tesseract is REQUIRED for data extraction."
+    echo "Install it with: sudo apt update && sudo apt install tesseract-ocr tesseract-ocr-hin"
+    exit 1
+fi
+echo -e "${GREEN}[OK]${NC} Tesseract found: $(tesseract --version 2>&1 | head -n 1)"
+echo "  Location: $(which tesseract)"
+
 # Check if virtual environment exists
 VENV_PATH="$PROJECT_ROOT/backend/python-service/venv"
 if [ ! -d "$VENV_PATH" ]; then

@@ -44,6 +44,16 @@ class OCRProcessor400DPI:
         self.dpi = 300  # Modified to 300 DPI as requested
         self.current_lang = 'mr' # Default to Marathi
         
+        # Configure Tesseract path from environment (critical for systemd services)
+        tesseract_cmd = os.getenv('TESSERACT_CMD')
+        if tesseract_cmd:
+            pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+        elif os.name != 'nt':  # Linux/Unix - ensure tesseract is findable
+            for path in ['/usr/bin/tesseract', '/usr/local/bin/tesseract']:
+                if os.path.exists(path):
+                    pytesseract.pytesseract.tesseract_cmd = path
+                    break
+        
         # Voter ID patterns (Indian EPIC format)
         self.voter_id_patterns = [
             r'\b[A-Z]{3}[0-9]{7}\b',           # Standard: ABC1234567

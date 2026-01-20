@@ -20,6 +20,22 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
+# Configure Tesseract path early (critical for systemd services)
+try:
+    import pytesseract
+    tesseract_cmd = os.getenv('TESSERACT_CMD')
+    if tesseract_cmd and os.path.exists(tesseract_cmd):
+        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+        print(f"Tesseract configured: {tesseract_cmd}")
+    elif os.name != 'nt':  # Linux/Unix
+        for path in ['/usr/bin/tesseract', '/usr/local/bin/tesseract']:
+            if os.path.exists(path):
+                pytesseract.pytesseract.tesseract_cmd = path
+                print(f"Tesseract found: {path}")
+                break
+except ImportError:
+    pass  # pytesseract not imported yet, will be set in modules
+
 # Configure logging - Optimized for performance
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'WARNING').upper()  # Default to WARNING (less verbose)
 ENABLE_CONSOLE_LOG = os.getenv('ENABLE_CONSOLE_LOG', 'False').lower() == 'true'

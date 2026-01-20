@@ -3,6 +3,7 @@ Smart Detector - Automatically finds Voter ID and Photo in each cell
 Uses pattern recognition to identify alphanumeric text and human faces
 """
 
+import os
 import re
 import io
 import base64
@@ -25,6 +26,16 @@ class SmartDetector:
     
     def __init__(self):
         """Initialize smart detector"""
+        # Configure Tesseract path from environment (critical for systemd services)
+        tesseract_cmd = os.getenv('TESSERACT_CMD')
+        if tesseract_cmd:
+            pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+        elif os.name != 'nt':  # Linux/Unix
+            for path in ['/usr/bin/tesseract', '/usr/local/bin/tesseract']:
+                if os.path.exists(path):
+                    pytesseract.pytesseract.tesseract_cmd = path
+                    break
+        
         self.voter_id_pattern = re.compile(r'[A-Z]{3}[0-9]{7}|[A-Z0-9]{10,}')
         print("OK: Smart Detector initialized")
     

@@ -54,8 +54,13 @@ except ImportError:
     OCR_400DPI_AVAILABLE = False
     pass  # 400 DPI OCR Processor optional
 
-# Try to automatically locate Tesseract on Windows (fallback)
-if os.name == 'nt':  # Windows
+# Configure Tesseract OCR path
+# Priority: 1. TESSERACT_CMD env var, 2. Auto-detect by OS
+tesseract_cmd_from_env = os.getenv('TESSERACT_CMD')
+if tesseract_cmd_from_env:
+    # Use explicitly set path from environment (important for systemd services)
+    pytesseract.pytesseract.tesseract_cmd = tesseract_cmd_from_env
+elif os.name == 'nt':  # Windows - auto-detect
     possible_paths = [
         r'C:\Program Files\Tesseract-OCR\tesseract.exe',
         r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
@@ -64,7 +69,17 @@ if os.name == 'nt':  # Windows
     for path in possible_paths:
         if os.path.exists(path):
             pytesseract.pytesseract.tesseract_cmd = path
-            pass  # Tesseract found
+            break
+else:
+    # Linux/Unix - try common locations if not in PATH
+    linux_paths = [
+        '/usr/bin/tesseract',
+        '/usr/local/bin/tesseract',
+        '/bin/tesseract'
+    ]
+    for path in linux_paths:
+        if os.path.exists(path):
+            pytesseract.pytesseract.tesseract_cmd = path
             break
 
 # Initialize processors
