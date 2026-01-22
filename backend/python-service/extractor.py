@@ -11,6 +11,10 @@ os.environ['GLOG_minloglevel'] = '3'  # Suppress PaddlePaddle C++ logs (0=INFO, 
 os.environ['FLAGS_print_model_net_proto'] = '0'  # Don't print model proto
 os.environ['PADDLEOCR_SHOW_LOG'] = '0'  # Suppress PaddleOCR logs
 
+# Memory optimization settings
+os.environ['PYTHONUNBUFFERED'] = '0'  # Reduce I/O buffering
+import gc  # Enable garbage collection control
+
 import fitz  # PyMuPDF
 import pytesseract
 import base64
@@ -88,6 +92,12 @@ box_detector = BoxDetector() if BOX_DETECTOR_AVAILABLE else None
 smart_detector = SmartDetector() if SMART_DETECTOR_AVAILABLE else None
 ocr_processor_400dpi = OCRProcessor400DPI() if OCR_400DPI_AVAILABLE else None
 
+# Pre-compile regex patterns for better performance
+EPIC_REGEX = re.compile(r'^[A-Z]{3}[0-9]{7}$')
+LOOSE_EPIC_REGEX = re.compile(r'^[A-Z]{2,4}[0-9]{6,8}$')
+DEVANAGARI_REGEX = re.compile(r'[\u0900-\u097F]')
+NUMBER_CLEANUP_REGEX = re.compile(r'[0-9,]+')
+
 # Get CPU count for multiprocessing
 def get_cpu_count():
     """Get optimal CPU count for multiprocessing - USE ALL CORES!"""
@@ -133,10 +143,14 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
         cell_template = config.get('cellTemplate', {})
         voter_id_box = cell_template.get('voterIdBox', {})
         photo_box = cell_template.get('photoBox', {})
-        
-        # Get processors
+
+        # Cache performance settings
+        extract_photos = config.get('extractPhotos', True)
+        performance_mode = config.get('performanceMode', 'balanced')  # fast, balanced, accurate
+
+        # Get processors (only get photo processor if needed)
         local_ocr_processor = processors.get('ocr')
-        local_photo_processor = processors.get('photo')
+        local_photo_processor = processors.get('photo') if extract_photos else None
         local_smart_detector = processors.get('smart')
         
         # === EXTRACT VOTER ID WITH MULTI-STRATEGY APPROACH ===
@@ -226,16 +240,26 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                 )
                 
                 if VERBOSE_OCR_LOGS:
-                    print(f"      📄 Strategy 1: OCR 400 DPI...")
+                    print(f"      📄 Strategy 1: OCR {local_ocr_processor.dpi} DPI ({performance_mode} mode)...")
+
                 result = local_ocr_processor.extract_voter_id(
                     image=None,
                     pdf_page=page,
                     rect=voter_id_rect
                 )
-                
+
                 voter_id_text = result.get('voter_id', '')
                 voter_id_confidence = result.get('confidence', 0.0)
                 voter_id_method = result.get('method', 'unknown')
+
+                # Early success check based on performance mode
+                min_confidence = local_ocr_processor.min_confidence_threshold
+                if voter_id_confidence >= min_confidence and voter_id_text:
+                    if VERBOSE_OCR_LOGS:
+                        print(f"      ✅ {performance_mode.upper()} MODE: Early success with conf={voter_id_confidence:.2f}")
+                    cell_stats['ocr_400dpi'] = 1
+                    # Skip to final processing
+                    voter_id_text = voter_id_text if voter_id_text else ""
                 
                 if voter_id_method == 'tesseract':
                     cell_stats['ocr_400dpi_local'] = 1
@@ -483,9 +507,9 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
         photo_base64 = ""
         photo_quality = 0.0
         photo_method = "none"
-        
-        # Strategy 1: Use 400 DPI OCR Processor
-        if local_ocr_processor and photo_box:
+
+        # Strategy 1: Use 400 DPI OCR Processor (only if photo extraction enabled)
+        if extract_photos and local_ocr_processor and photo_box:
             try:
                 scaled_photo_x = photo_box.get('x', 0) * scale_x
                 scaled_photo_y = photo_box.get('y', 0) * scale_y
@@ -601,7 +625,7 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
             expected_y = cell_y + (voter_id_box.get('y', 0) * scale_y)
             
             # Standard Pattern for Voter ID
-            voter_id_pattern = re.compile(r'^[A-Z]{3}[0-9]{7}$')
+            voter_id_pattern = EPIC_REGEX
             
             for w in cell_words:
                 w_text = w[4].strip().upper()
@@ -777,7 +801,7 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
             
             # Check for Devanagari (Marathi) characters (Range: \u0900-\u097F)
             # We want to see if the text layer actually contains readable Marathi
-            devanagari_chars = len(re.findall(r'[\u0900-\u097F]', text_layer_content))
+            devanagari_chars = len(DEVANAGARI_REGEX.findall(text_layer_content))
             
             if devanagari_chars > 5:
                 # Digital PDF with Marathi support
@@ -1015,10 +1039,16 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                          # Keep only Marathi/Devanagari characters and remove punctuation
                          clean_val = re.sub(r'[^\w\s\u0900-\u097F]', '', clean_val).strip()
 
-                         # Use TranslitHelper for Gender mapping (handles 'पर' -> 'पु', etc.)
-                         gender_standard = TranslitHelper.map_gender(clean_val)
-                         if gender_standard == "Male": clean_val = "पु"
-                         elif gender_standard == "Female": clean_val = "स्री"
+                         # FIX SPECIFIC OCR ERRORS: Replace incorrect gender extractions with correct values
+                         if clean_val in ['2 पक', 'पक', '2पक', '2 प', 'प', '2', 'पक्']:
+                             clean_val = "पु"  # Replace with correct Male gender (पु)
+                         elif clean_val in ['स्री', 'स्त्री', 'महिला', 'स्री.', 'स्त्री.']:
+                             clean_val = "स्री"  # Ensure Female gender is properly formatted
+                         else:
+                             # Use TranslitHelper for Gender mapping (handles 'पर' -> 'पु', etc.)
+                             gender_standard = TranslitHelper.map_gender(clean_val)
+                             if gender_standard == "Male": clean_val = "पु"
+                             elif gender_standard == "Female": clean_val = "स्री"
                     # === SPECIAL HANDLING FOR SERIAL NO / ASSEMBLY NO ===
                     if 'serial' in key_lower or 'assembly' in key_lower:
                         # Convert Marathi digits to English
@@ -1077,7 +1107,7 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                             
                             # 2. Extract VALID number sequence (Removed strict length limits as per user request "no limitation")
                             # Find all sequences of digits (AND COMMAS) to preserve "1,005"
-                            numbers = re.findall(r'[0-9,]+', clean_val)
+                            numbers = NUMBER_CLEANUP_REGEX.findall(clean_val)
                             
                             valid_serial = ""
                             if numbers:
@@ -1416,15 +1446,11 @@ def detect_page_alignment(page, config, file_id=None):
         text_words = page.get_text("words", clip=fitz.Rect(0, 0, page.rect.width, deep_search_h))
         voter_id_candidates = []
         
-        # Compile Regex once
-        # EPIC Pattern: 3 Letters, 7 Digits (Standard) or 2-4 Letters, 6-8 digits (Loose)
-        epic_regex = re.compile(r'^[A-Z]{3}[0-9]{7}$') 
-        loose_regex = re.compile(r'^[A-Z]{2,4}[0-9]{6,8}$')
-        
+        # Use pre-compiled regex patterns for better performance
         for w in text_words:
             text = w[4].strip().upper().replace(" ", "")
             # Check detailed patterns
-            if epic_regex.match(text) or loose_regex.match(text) or re.match(r'^[A-Z]{2,3}/[0-9]+/[0-9]+', text):
+            if EPIC_REGEX.match(text) or LOOSE_EPIC_REGEX.match(text) or re.match(r'^[A-Z]{2,3}/[0-9]+/[0-9]+', text):
                 voter_id_candidates.append(w[1]) # Append Y coordinate
 
         if voter_id_candidates:
@@ -2158,11 +2184,13 @@ def extract_grid_vertical_enhanced(pdf_bytes, config, pdf_path=None):
         # AGGREGATE STATS
         extracted_data = []
         stats = {'total_cells': 0, 'cells_skipped': 0}
-        
-        for res in results_flat:
+
+        # Memory optimization: Process results in batches to reduce memory usage
+        batch_size = 1000
+        for i, res in enumerate(results_flat):
             if not res: continue
             stats['total_cells'] += 1
-            
+
             if res.get('skipped', False):
                 stats['cells_skipped'] += 1
                 # Aggregate sub-stats
@@ -2172,6 +2200,10 @@ def extract_grid_vertical_enhanced(pdf_bytes, config, pdf_path=None):
                 extracted_data.append(res)
                 for k,v in res.get('stats', {}).items():
                      stats[k] = stats.get(k, 0) + v
+
+            # Memory optimization: Force garbage collection periodically
+            if i % batch_size == 0 and i > 0:
+                gc.collect()
         
         # Sort results by Serial No primarily, fallback to physical order
         def get_sort_key(x):

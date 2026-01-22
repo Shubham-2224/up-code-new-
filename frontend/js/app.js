@@ -47,6 +47,8 @@ const elements = {
     // Extraction
     btnExtract: document.getElementById('btnExtract'),
     btnDownload: document.getElementById('btnDownload'),
+    extractPhotos: document.getElementById('extractPhotos'),
+    performanceMode: document.getElementById('performanceMode'),
     extractionStatus: document.getElementById('extractionStatus'),
 
     // Preview
@@ -345,7 +347,9 @@ async function handleExtract() {
             skipFooterHeight: (parseInt(elements.skipFooterHeight.value) || 0) / pdfScale,
             grid: gridConfig,
             cellTemplate: cellTemplate,
-            pageTemplate: gridOverlay.getPageTemplate() // NEW: Include page template
+            pageTemplate: gridOverlay.getPageTemplate(), // Include page template
+            extractPhotos: elements.extractPhotos.checked, // Photo extraction control
+            performanceMode: elements.performanceMode.value // Performance mode control
         };
 
         console.log('Extraction Configuration (converted to PDF coordinates):', config);
