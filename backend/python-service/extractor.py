@@ -1727,13 +1727,22 @@ def process_single_page_worker(task_info):
         
         results = []
         
+        # === PERFORMANCE OPTIMIZATION: RENDER PAGE ONCE ===
+        # Use a shared 300 DPI render for all extraction tasks (Header + Cells)
+        master_page_img = None
+        master_page_scale = 300 / 72.0 
+        try:
+            # print(f"      🚀 Page Optimization: Rendering full page at 300 DPI once...")
+            page_pix = page.get_pixmap(dpi=300, alpha=False)
+            master_page_img = Image.frombytes("RGB", [page_pix.width, page_pix.height], page_pix.samples)
+        except Exception as e:
+            print(f"      ⚠️  Master page render failed: {e}")
+
         # === EXTRACT PAGE LEVEL FIELDS (Booth Info) ===
         page_data = {}
-        # Make sure to use the template from the SELECTED config
         page_template = config.get('pageTemplate', {})
         
         if page_template and processors.get('ocr'):
-            # ... (Existing Page Extraction Logic) ...
              for field_key, field_box in page_template.items():
                     try:
                         r_x = field_box.get('x', 0)
@@ -1743,43 +1752,118 @@ def process_single_page_worker(task_info):
                         
                         full_rect = fitz.Rect(r_x, r_y, r_x + r_w, r_y + r_h)
                         
+                        # Apply y_offset to header fields too if they are shifted
+                        # (Usually header is static, but sometimes shifted with the grid)
+                        # We use a small fraction of offset for header if it's very large
+                        # But typically header elements relate to page top 
+                        
+                        # Crop from master image for speed and quality
+                        cropped_field_img = None
+                        if master_page_img:
+                            left = r_x * master_page_scale
+                            top = r_y * master_page_scale
+                            right = (r_x + r_w) * master_page_scale
+                            bottom = (r_y + r_h) * master_page_scale
+                            cropped_field_img = master_page_img.crop((left, top, right, bottom))
+
+                        # Determine if this is a booth-related field (Center or Address)
+                        is_booth_field = any(k in field_key.lower() for k in ['booth', 'center', 'address'])
+                        
+                        # Rule: For booth fields, do NOT force Marathi-only
+                        force_marathi_val = not is_booth_field
+                        
                         field_res = processors['ocr'].extract_full_cell_text(
-                            image=None,
-                            pdf_page=page,
-                            rect=full_rect,
-                            force_marathi=True 
+                            image=cropped_field_img,
+                            pdf_page=None if cropped_field_img else page,
+                            rect=None if cropped_field_img else full_rect,
+                            force_marathi=force_marathi_val 
                         )
                         
                         val = field_res.get('text', '').strip()
-                        val = re.sub(r'[|]', '', val) 
+                        
+                        # CLEANUP: Remove common OCR garbage
+                        val = re.sub(r'[|:;!॥\--]', '', val).strip()
+                        val = ' '.join(val.split())
+                        
                         page_data[field_key] = val
                         
+                        # Populate English variant if missing
                         if val:
                             try:
                                 english_val = TranslitHelper.transliterate_marathi_to_english(val)
                                 page_data[f"{field_key}English"] = english_val
                             except:
                                 page_data[f"{field_key}English"] = ""
-                    except: pass
+                                
+                    except Exception as e:
+                        print(f"      ⚠️  Header field {field_key} error: {e}")
+                        pass
+
+             # === SMART FALLBACK: Search for missing booth info if not found via template ===
+             # If boothCenter or boothAddress is missing or very short, try to find it by scanning the top region
+             if (not page_data.get('boothCenter') or len(page_data.get('boothCenter', '')) < 5) and master_page_img:
+                 try:
+                     # print(f"      🔍 Smart Fallback: Searching for Booth Center in header...")
+                     # Scan Top 15% of the page
+                     header_h = int(page.rect.height * 0.15)
+                     header_rect = fitz.Rect(0, 0, page.rect.width, header_h)
+                     
+                     # Extract all text from header using OCR
+                     header_pix = page.get_pixmap(clip=header_rect, dpi=200, alpha=False)
+                     header_img = Image.frombytes("RGB", [header_pix.width, header_pix.height], header_pix.samples)
+                     
+                     header_res = processors['ocr'].extract_full_cell_text(
+                         image=header_img,
+                         force_marathi=False
+                     )
+                     
+                     header_text = header_res.get('text', '')
+                     if header_text:
+                         # Look for Booth Center keywords: "मतदान केंद्राचे नाव", "Polling Station Name"
+                         # Logic: Usually the text AFTER the label is the value
+                         booth_patterns = [
+                             r'(?:मतदान केंद्राचे नाव|नाम|नाव)\s*[:\-]*\s*(.*)',
+                             r'(?:Polling Station Name|Station Name)\s*[:\-]*\s*(.*)'
+                         ]
+                         
+                         for pattern in booth_patterns:
+                             match = re.search(pattern, header_text, re.IGNORECASE)
+                             if match:
+                                 detected_val = match.group(1).split('\n')[0].strip()
+                                 if len(detected_val) > 5:
+                                     # print(f"      ✨ Smart Detected Booth Center: {detected_val}")
+                                     page_data['boothCenter'] = detected_val
+                                     try:
+                                         page_data['boothCenterEnglish'] = TranslitHelper.transliterate_marathi_to_english(detected_val)
+                                     except: pass
+                                     break
+                         
+                         # Look for Booth Address keywords: "पत्ता", "Address"
+                         address_patterns = [
+                             r'(?:मतदान केंद्राचे पत्ता|पत्ता)\s*[:\-]*\s*(.*)',
+                             r'(?:Polling Station Address|Address)\s*[:\-]*\s*(.*)'
+                         ]
+                         
+                         for pattern in address_patterns:
+                             match = re.search(pattern, header_text, re.IGNORECASE)
+                             if match:
+                                 detected_val = match.group(1).split('\n')[0].strip()
+                                 if len(detected_val) > 5:
+                                     # print(f"      ✨ Smart Detected Booth Address: {detected_val}")
+                                     page_data['boothAddress'] = detected_val
+                                     try:
+                                         page_data['boothAddressEnglish'] = TranslitHelper.transliterate_marathi_to_english(detected_val)
+                                     except: pass
+                                     break
+                 except: pass
 
         # Process Cells
-        # PERFORMANCE OPTIMIZATION: Render the whole page at 300 DPI once 
-        # and crop from it in memory. This is 10x faster than rendering each field.
-        master_page_img = None
-        master_page_scale = 300 / 72.0 # Standard PDF units (72) to 300 DPI
-        try:
-            print(f"      🚀 Page Optimization: Rendering full page at 300 DPI once...")
-            page_pix = page.get_pixmap(dpi=300, alpha=False)
-            master_page_img = Image.frombytes("RGB", [page_pix.width, page_pix.height], page_pix.samples)
-        except Exception as e:
-            print(f"      ⚠️  Master page render failed (falling back to per-cell rendering): {e}")
-
         for cell_info in cells_to_process:
             result = _extract_cell_internal(
                 page=page,
                 page_num=page_num,
                 cell_info=cell_info,
-                config=config, # USE CONFIG
+                config=config, 
                 extraction_limits=extraction_limits, 
                 processors=processors,
                 master_page_img=master_page_img,
@@ -2021,6 +2105,15 @@ def process_page(pdf_path, page_num, config, template, box_detector_config=None)
         
         page_results = []
         
+        # === PERFORMANCE OPTIMIZATION: RENDER PAGE ONCE ===
+        master_page_img = None
+        master_page_scale = 400 / 72.0  # Workers use 400 DPI
+        try:
+            page_pix = page.get_pixmap(dpi=400, alpha=False)
+            master_page_img = Image.frombytes("RGB", [page_pix.width, page_pix.height], page_pix.samples)
+        except Exception as e:
+            print(f"      ⚠️  Master page render failed in worker: {e}")
+
         # === EXTRACT PAGE LEVEL FIELDS (Booth Info) ===
         page_data = {}
         page_template = config.get('pageTemplate', {})
@@ -2034,16 +2127,32 @@ def process_page(pdf_path, page_num, config, template, box_detector_config=None)
                         r_h = field_box.get('height', 0)
                         
                         full_rect = fitz.Rect(r_x, r_y, r_x + r_w, r_y + r_h)
+
+                        # Crop from master image
+                        cropped_field_img = None
+                        if master_page_img:
+                            left = r_x * master_page_scale
+                            top = r_y * master_page_scale
+                            right = (r_x + r_w) * master_page_scale
+                            bottom = (r_y + r_h) * master_page_scale
+                            cropped_field_img = master_page_img.crop((left, top, right, bottom))
+                        
+                        # Determine if this is a booth-related field
+                        is_booth_field = any(k in field_key.lower() for k in ['booth', 'center', 'address'])
+                        force_marathi_val = not is_booth_field
                         
                         field_res = processors['ocr'].extract_full_cell_text(
-                            image=None,
-                            pdf_page=page,
-                            rect=full_rect,
-                            force_marathi=True 
+                            image=cropped_field_img,
+                            pdf_page=None if cropped_field_img else page,
+                            rect=None if cropped_field_img else full_rect,
+                            force_marathi=force_marathi_val 
                         )
                         
                         val = field_res.get('text', '').strip()
-                        val = re.sub(r'[|]', '', val) 
+                        # CLEANUP: Remove common OCR garbage
+                        val = re.sub(r'[|:;!॥\--]', '', val).strip()
+                        val = ' '.join(val.split())
+                        
                         page_data[field_key] = val
                         
                         if val:
@@ -2052,7 +2161,41 @@ def process_page(pdf_path, page_num, config, template, box_detector_config=None)
                                 page_data[f"{field_key}English"] = english_val
                             except:
                                 page_data[f"{field_key}English"] = ""
-                    except: pass
+                    except Exception as e:
+                        pass
+
+             # === SMART FALLBACK: Search for missing booth info if not found via template ===
+             if (not page_data.get('boothCenter') or len(page_data.get('boothCenter', '')) < 5) and master_page_img:
+                 try:
+                     header_h = int(page.rect.height * 0.15)
+                     header_rect = fitz.Rect(0, 0, page.rect.width, header_h)
+                     header_pix = page.get_pixmap(clip=header_rect, dpi=200, alpha=False)
+                     header_img = Image.frombytes("RGB", [header_pix.width, header_pix.height], header_pix.samples)
+                     
+                     header_res = processors['ocr'].extract_full_cell_text(image=header_img, force_marathi=False)
+                     header_text = header_res.get('text', '')
+                     if header_text:
+                         # Booth Center patterns
+                         for p in [r'(?:मतदान केंद्राचे नाव|नाम|नाव)\s*[:\-]*\s*(.*)', r'(?:Polling Station Name|Station Name)\s*[:\-]*\s*(.*)']:
+                             m = re.search(p, header_text, re.IGNORECASE)
+                             if m:
+                                 det = m.group(1).split('\n')[0].strip()
+                                 if len(det) > 5:
+                                     page_data['boothCenter'] = det
+                                     try: page_data['boothCenterEnglish'] = TranslitHelper.transliterate_marathi_to_english(det)
+                                     except: pass
+                                     break
+                         # Booth Address patterns
+                         for p in [r'(?:मतदान केंद्राचे पत्ता|पत्ता)\s*[:\-]*\s*(.*)', r'(?:Polling Station Address|Address)\s*[:\-]*\s*(.*)']:
+                             m = re.search(p, header_text, re.IGNORECASE)
+                             if m:
+                                 det = m.group(1).split('\n')[0].strip()
+                                 if len(det) > 5:
+                                     page_data['boothAddress'] = det
+                                     try: page_data['boothAddressEnglish'] = TranslitHelper.transliterate_marathi_to_english(det)
+                                     except: pass
+                                     break
+                 except: pass
 
         # Process Cells
         for cell_info in cells_to_process:
