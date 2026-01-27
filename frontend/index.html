@@ -67,16 +67,25 @@
                 <div class="sidebar-section">
                     <h2 class="section-title">
                         <span class="step-number">3</span>
-                        Additional Details
+                        Header/Footer
                     </h2>
                     <div class="form-group">
-                        <label>Prabhag</label>
-                        <input type="text" id="prabhag" placeholder="Enter Prabhag" class="input-field">
+                        <label>Header Height (px)</label>
+                        <input type="number" id="skipHeaderHeight" value="80" min="0" class="input-field">
                     </div>
                     <div class="form-group">
-                        <label>Booth No</label>
-                        <input type="text" id="boothNo" placeholder="Enter Booth No" class="input-field">
+                        <label>Footer Height (px)</label>
+                        <input type="number" id="skipFooterHeight" value="60" min="0" class="input-field">
                     </div>
+                    <button class="btn btn-secondary" id="btnShowSkipZones">
+                        <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                        </svg>
+                        Preview Skip Zones
+                    </button>
                 </div>
 
                 <div class="sidebar-section">
@@ -103,7 +112,7 @@
                     </button>
                     <div class="sidebar-section">
                         <h2 class="section-title">
-                            <span class="step-number">5</span>
+                            <span class="step-number">4</span>
                             Grid Configuration
                         </h2>
                         <div class="form-group">
@@ -122,7 +131,7 @@
 
                     <div class="sidebar-section">
                         <h2 class="section-title">
-                            <span class="step-number">6</span>
+                            <span class="step-number">5</span>
                             Cell Template
                         </h2>
                         <div style="display: flex; gap: 10px; margin-bottom: 10px;">
@@ -155,6 +164,21 @@
                             Apply Template
                         </button>
                         <div id="templateStatus" class="template-status hidden"></div>
+                    </div>
+
+                    <div class="sidebar-section">
+                        <h2 class="section-title">
+                            <span class="step-number">6</span>
+                            Additional Details
+                        </h2>
+                        <div class="form-group">
+                            <label>Prabhag</label>
+                            <input type="text" id="prabhag" placeholder="Enter Prabhag" class="input-field">
+                        </div>
+                        <div class="form-group">
+                            <label>Booth No</label>
+                            <input type="text" id="boothNo" placeholder="Enter Booth No" class="input-field">
+                        </div>
                     </div>
 
                     <div class="sidebar-section">

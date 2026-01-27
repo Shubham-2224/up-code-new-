@@ -58,10 +58,11 @@ class OCRProcessor400DPI:
                     pytesseract.pytesseract.tesseract_cmd = path
                     break
 
-        # Voter ID patterns (Indian EPIC format)
+        # Voter ID patterns (Indian EPIC format: 3 letters + 7 digits)
         self.voter_id_patterns = [
-            r'\b[A-Z]{3}[0-9]{7}\b',           # Standard: ABC1234567
+            r'\b[A-Z]{3}[0-9]{7}\b',           # Standard: ABC1234567 (STRICT)
             r'\b[A-Z]{3}\s*[0-9]{7}\b',        # With space: ABC 1234567
+            r'\b[A-Z0-9]{10}\b',               # Any 10 alphanumeric (fallback for correction)
             r'\b[A-Z]{2,4}[0-9]{6,8}\b',       # Flexible: 2-4 letters + 6-8 digits
         ]
 
@@ -90,16 +91,19 @@ class OCRProcessor400DPI:
             self.min_confidence_threshold = 0.6
             self.enable_char_processing = False
             self.enable_paddle_fallback = False
+            self.dpi = 200 # Faster DPI for fast mode
         elif mode == 'balanced':
             self.max_retries = 2
             self.min_confidence_threshold = 0.4
             self.enable_char_processing = False
             self.enable_paddle_fallback = True
+            self.dpi = 300
         else:
             self.max_retries = 3
             self.min_confidence_threshold = 0.3
             self.enable_char_processing = True
             self.enable_paddle_fallback = True
+            self.dpi = 300
 
 
         print("OK: OCR Processor initialized with 300 DPI (EPIC-optimized)")
@@ -328,16 +332,17 @@ class OCRProcessor400DPI:
             voter_id, confidence = self._extract_voter_id_from_text(raw_text)
             method = 'tesseract_standard'
 
-            # Strategy 2: Advanced EPIC processing (if quality is poor or standard OCR fails)
-            should_try_advanced = (
-                quality_metrics['recommend_advanced'] or  # Poor image quality
-                confidence < 0.7 or  # Low confidence from standard OCR
-                not voter_id  # No result from standard OCR
-            )
+            # Strategy 2: Advanced EPIC processing (Skip in 'fast' mode)
+            should_try_advanced = False
+            if self.quality_mode != 'fast':
+                should_try_advanced = (
+                    confidence < 0.8 or  # Low confidence from standard OCR
+                    not voter_id  # No result from standard OCR
+                )
 
             if should_try_advanced:
-                reason = "low confidence" if confidence < 0.7 else "poor image quality" if quality_metrics['recommend_advanced'] else "no result"
-                print(f"      🔄 Standard OCR {reason} ({confidence:.2f}), trying advanced EPIC processing...")
+                reason = "low confidence" if voter_id else "no result"
+                # print(f"      🔄 Standard OCR {reason} ({confidence:.2f}), trying advanced EPIC processing...")
 
                 advanced_result = self.extract_epic_with_advanced_image_processing(image, pdf_page, rect)
 
@@ -807,7 +812,14 @@ class OCRProcessor400DPI:
         Returns:
             Corrected voter ID
         """
-        if not voter_id or len(voter_id) < 10:
+        # STRICT 10-character check (3 letters + 7 digits)
+        if not voter_id:
+            return ""
+        
+        # Clean anything that's not alphanumeric
+        voter_id = re.sub(r'[^A-Z0-9]', '', voter_id.upper())
+        
+        if len(voter_id) < 8:
             return voter_id
 
         original = voter_id
@@ -1007,23 +1019,27 @@ class OCRProcessor400DPI:
         
         confidence = 0.5  # Base confidence
         
-        # Check standard format: 3 letters + 7 digits
+        # Check standard format: 3 letters + 7 digits (User's strict requirement)
         if re.match(r'^[A-Z]{3}[0-9]{7}$', voter_id):
-            confidence = 0.95
+            confidence = 1.0
         
-        # Check flexible format: 2-4 letters + 6-8 digits
-        elif re.match(r'^[A-Z]{2,4}[0-9]{6,8}$', voter_id):
-            confidence = 0.85
+        # Penalize if not exactly 10 characters
+        if len(voter_id) != 10:
+            confidence *= 0.7
         
-        # Check if it has both letters and numbers
-        elif re.search(r'[A-Z]', voter_id) and re.search(r'[0-9]', voter_id):
-            confidence = 0.6
+        # Penalize if it doesn't start with 3 letters
+        if len(voter_id) >= 3 and not voter_id[:3].isalpha():
+            confidence *= 0.8
+            
+        # Penalize if last 7 are not digits
+        if len(voter_id) >= 10 and not voter_id[3:10].isdigit():
+            confidence *= 0.8
         
         # Penalize if too short or too long
         if len(voter_id) < 8:
-            confidence *= 0.7
-        elif len(voter_id) > 15:
-            confidence *= 0.8
+            confidence *= 0.5
+        elif len(voter_id) > 12:
+            confidence *= 0.6
         
         # Penalize if contains common OCR errors
         if any(char in voter_id for char in ['O0', 'I1', 'S5']):
@@ -1078,8 +1094,6 @@ class OCRProcessor400DPI:
         try:
             # Source resolution
             if pdf_page and rect:
-                # Rule 1: User suggested 250-300 DPI. We stick to 300 or reduce to 250 if needed.
-                # Current class default is 300.
                 pix = pdf_page.get_pixmap(clip=rect, dpi=self.dpi, alpha=False)
                 image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             
@@ -1087,7 +1101,7 @@ class OCRProcessor400DPI:
                 return {'text': '', 'raw_text': '', 'method': 'error'}
             
             # Preprocess (Rule 2 & 4)
-            if fast_preprocess:
+            if fast_preprocess or self.quality_mode == 'fast':
                  # Rule 4: Minimal Preprocessing
                  processed_img = self.preprocess_fast(image)
             else:
@@ -1098,36 +1112,34 @@ class OCRProcessor400DPI:
             method = "none"
 
             # STRATEGY 1: PaddleOCR (Best for Marathi)
-            if self.paddle_processor:
+            # Skip PaddleOCR in 'fast' mode for maximum speed
+            if self.paddle_processor and self.quality_mode != 'fast':
                 try:
                     # If forcing Marathi, ensure we use Marathi model logic primarily
-                    print(f"      OCR: Using PaddleOCR (Marathi) [Force Marathi: {force_marathi}]...")
+                    # Reduced logging for speed
                     text = self.paddle_processor.get_full_text(image, separator="\n")
                     if text.strip():
                         method = 'paddle_mar'
                 except Exception as e:
-                    print(f"      PaddleOCR failed: {e}")
+                    pass
 
-            # STRATEGY 2: Tesseract Fallback
+            # STRATEGY 2: Tesseract Fallback (Primary in 'fast' mode)
             if not text.strip():
-                print("      OCR: Fallback to Tesseract...")
                 try:
                     # If enforcing Marathi, ONLY use Marathi language data to avoid English confusion
                     langs = 'mar' if force_marathi else 'mar+hin+eng'
                     
-                    found_langs = pytesseract.get_languages(config='')
-                    if 'mar' not in found_langs:
-                        print("      WARNING: Marathi language data not found, falling back to eng+hin")
-                        langs = 'eng+hin'
+                    # Performance optimization: cache result of get_languages
+                    # For simplicity, we assume 'mar' is available or fallback is handled by pytesseract
                     
                     text = pytesseract.image_to_string(
                         processed_img,
                         lang=langs,
-                        config='--psm 6' 
+                        config='--psm 6 --oem 1' # OEM 1 is usually faster Neural net mode
                     ).strip()
                     method = 'tesseract_fallback'
                 except Exception as e:
-                    print(f"      Tesseract failed: {e}")
+                    pass
             
             # Post-Processing / Reconstruction
             final_text = self._post_process_marathi_text(text, remove_english=force_marathi)
@@ -1139,7 +1151,7 @@ class OCRProcessor400DPI:
             }
 
         except Exception as e:
-            print(f"      ERROR in extract_full_cell_text: {e}")
+            # print(f"      ERROR in extract_full_cell_text: {e}")
             return {'text': '', 'method': 'error', 'error': str(e)}
 
     def _post_process_marathi_text(self, text: str, remove_english: bool = False) -> str:

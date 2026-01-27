@@ -26,7 +26,10 @@ def generate_excel(data: List[Dict], output_path: str) -> bool:
         worksheet = workbook.active
         worksheet.title = 'Voter Data'
         
-        # Define headers
+        # Determine if we should include the image column
+        include_images = any(record.get('image_base64') for record in data)
+        
+        # Define base headers
         headers = [
             'Serial No', 
             'EPIC No', 
@@ -38,17 +41,19 @@ def generate_excel(data: List[Dict], output_path: str) -> bool:
             'Age', 'Assembly No',
             'Booth Center', 'Booth Center (English)',
             'Booth Address', 'Booth Address (English)',
-            'Prabhag', 'Booth No',
-            'Base64 Image String'
+            'Prabhag', 'Booth No'
         ]
+        
+        if include_images:
+            headers.append('Base64 Image String')
         
         # Apply styling to headers
         header_font = Font(bold=True, size=12, color='FFFFFFFF')
         header_fill = PatternFill(start_color='FF4472C4', end_color='FF4472C4', fill_type='solid')
         header_alignment = Alignment(horizontal='center', vertical='center')
-
+ 
         worksheet.append(headers) 
-
+ 
         # Style header row
         for col_num in range(1, len(headers) + 1):
             cell = worksheet.cell(row=1, column=col_num)
@@ -74,7 +79,9 @@ def generate_excel(data: List[Dict], output_path: str) -> bool:
         worksheet.column_dimensions['O'].width = 30  # Booth Address (Eng)
         worksheet.column_dimensions['P'].width = 15  # Prabhag
         worksheet.column_dimensions['Q'].width = 15  # Booth No
-        worksheet.column_dimensions['R'].width = 25  # Base64
+        
+        if include_images:
+            worksheet.column_dimensions['R'].width = 25  # Base64
         
         # Define border style
         thin_border = Border(
@@ -123,9 +130,11 @@ def generate_excel(data: List[Dict], output_path: str) -> bool:
                 record.get('boothAddress', ''),
                 record.get('boothAddressEnglish', ''),
                 record.get('prabhag', ''),
-                record.get('boothNo', ''),
-                record.get('image_base64', '')
+                record.get('boothNo', '')
             ]
+
+            if include_images:
+                row_values.append(record.get('image_base64', ''))
             
             # Write row
             worksheet.append(row_values)

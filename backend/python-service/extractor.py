@@ -245,10 +245,10 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                 # OPTIMIZATION: Crop directly from master_page_img if available
                 voter_id_crop = None
                 if master_page_img:
-                    left = voter_id_rect.x1 * master_page_scale
-                    top = voter_id_rect.y1 * master_page_scale
-                    right = voter_id_rect.x2 * master_page_scale
-                    bottom = voter_id_rect.y2 * master_page_scale
+                    left = voter_id_rect.x0 * master_page_scale
+                    top = voter_id_rect.y0 * master_page_scale
+                    right = voter_id_rect.x1 * master_page_scale
+                    bottom = voter_id_rect.y1 * master_page_scale
                     voter_id_crop = master_page_img.crop((left, top, right, bottom))
 
                 result = local_ocr_processor.extract_voter_id(
@@ -513,103 +513,113 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
             except:
                 pass
         
-        # === EXTRACT PHOTO ===
+        # === EXTRACT PHOTO (Only if enabled) ===
         photo_base64 = ""
         photo_quality = 0.0
         photo_method = "none"
 
-        # Strategy 1: Use 400 DPI OCR Processor (only if photo extraction enabled)
-        if extract_photos and local_ocr_processor and photo_box:
-            try:
-                scaled_photo_x = photo_box.get('x', 0) * scale_x
-                scaled_photo_y = photo_box.get('y', 0) * scale_y
-                scaled_photo_width = photo_box.get('width', 150) * scale_x
-                scaled_photo_height = photo_box.get('height', 180) * scale_y
-                
-                photo_rect = fitz.Rect(
-                    cell_x + scaled_photo_x,
-                    cell_y + scaled_photo_y,
-                    cell_x + scaled_photo_x + scaled_photo_width,
-                    cell_y + scaled_photo_y + scaled_photo_height
-                )
-                
-                result = local_ocr_processor.extract_photo(
-                    image=None,
-                    pdf_page=page,
-                    rect=photo_rect
-                )
-                
-                photo_base64 = result.get('photo_base64', '')
-                photo_quality = result.get('confidence', 0.0)
-                photo_method = result.get('method', 'unknown')
-                
-                # Enhance photo if processor available
-                if photo_base64 and local_photo_processor:
-                    try:
-                        img_bytes = base64.b64decode(photo_base64)
-                        img = Image.open(io.BytesIO(img_bytes))
-                        photo_result = local_photo_processor.process_photo(img, enhance=True, resize=False)
+        if extract_photos:
+            # Strategy 1: Use 400 DPI OCR Processor (only if photo extraction enabled)
+            if local_ocr_processor and photo_box:
+                try:
+                    scaled_photo_x = photo_box.get('x', 0) * scale_x
+                    scaled_photo_y = photo_box.get('y', 0) * scale_y
+                    scaled_photo_width = photo_box.get('width', 150) * scale_x
+                    scaled_photo_height = photo_box.get('height', 180) * scale_y
+                    
+                    photo_rect = fitz.Rect(
+                        cell_x + scaled_photo_x,
+                        cell_y + scaled_photo_y,
+                        cell_x + scaled_photo_x + scaled_photo_width,
+                        cell_y + scaled_photo_y + scaled_photo_height
+                    )
+                    
+                    # OPTIMIZATION: Crop from master image for perfect alignment
+                    photo_crop = None
+                    if master_page_img:
+                        left = photo_rect.x0 * master_page_scale
+                        top = photo_rect.y0 * master_page_scale
+                        right = photo_rect.x1 * master_page_scale
+                        bottom = photo_rect.y1 * master_page_scale
+                        photo_crop = master_page_img.crop((left, top, right, bottom))
+
+                    result = local_ocr_processor.extract_photo(
+                        image=photo_crop,
+                        pdf_page=None if photo_crop else page,
+                        rect=None if photo_crop else photo_rect
+                    )
+                    
+                    photo_base64 = result.get('photo_base64', '')
+                    photo_quality = result.get('confidence', 0.0)
+                    photo_method = result.get('method', 'unknown')
+                    
+                    # Enhance photo if processor available
+                    if photo_base64 and local_photo_processor:
+                        try:
+                            img_bytes = base64.b64decode(photo_base64)
+                            img = Image.open(io.BytesIO(img_bytes))
+                            photo_result = local_photo_processor.process_photo(img, enhance=True, resize=False)
+                            photo_base64 = photo_result['base64']
+                            photo_quality = photo_result.get('quality_score', photo_quality)
+                            cell_stats['photo_enhanced'] = 1
+                        except:
+                            pass
+                    
+                    if photo_base64:
+                        cell_stats['photo_400dpi'] = 1
+                except:
+                    photo_base64 = ""
+                    photo_quality = 0.0
+            
+            # Strategy 2: Fallback to legacy method
+            elif photo_box:
+                try:
+                    scaled_photo_x = photo_box.get('x', 0) * scale_x
+                    scaled_photo_y = photo_box.get('y', 0) * scale_y
+                    scaled_photo_width = photo_box.get('width', 150) * scale_x
+                    scaled_photo_height = photo_box.get('height', 180) * scale_y
+                    
+                    photo_rect = fitz.Rect(
+                        cell_x + scaled_photo_x,
+                        cell_y + scaled_photo_y,
+                        cell_x + scaled_photo_x + scaled_photo_width,
+                        cell_y + scaled_photo_y + scaled_photo_height
+                    )
+                    
+                    photo_pix = page.get_pixmap(clip=photo_rect, dpi=300, alpha=False)
+                    # FAST BUFFER CONVERSION
+                    photo_img = Image.frombytes("RGB", [photo_pix.width, photo_pix.height], photo_pix.samples)
+                    
+                    if local_photo_processor:
+                        photo_result = local_photo_processor.process_photo(photo_img, enhance=True, resize=False)
                         photo_base64 = photo_result['base64']
-                        photo_quality = photo_result.get('quality_score', photo_quality)
+                        photo_quality = photo_result.get('quality_score', 0.5)
                         cell_stats['photo_enhanced'] = 1
-                    except:
-                        pass
-                
-                if photo_base64:
-                    cell_stats['photo_400dpi'] = 1
-            except:
-                photo_base64 = ""
-                photo_quality = 0.0
-        
-        # Strategy 2: Fallback to legacy method
-        elif photo_box:
-            try:
-                scaled_photo_x = photo_box.get('x', 0) * scale_x
-                scaled_photo_y = photo_box.get('y', 0) * scale_y
-                scaled_photo_width = photo_box.get('width', 150) * scale_x
-                scaled_photo_height = photo_box.get('height', 180) * scale_y
-                
-                photo_rect = fitz.Rect(
-                    cell_x + scaled_photo_x,
-                    cell_y + scaled_photo_y,
-                    cell_x + scaled_photo_x + scaled_photo_width,
-                    cell_y + scaled_photo_y + scaled_photo_height
-                )
-                
-                photo_pix = page.get_pixmap(clip=photo_rect, dpi=300, alpha=False)
-                # FAST BUFFER CONVERSION
-                photo_img = Image.frombytes("RGB", [photo_pix.width, photo_pix.height], photo_pix.samples)
-                
-                if local_photo_processor:
-                    photo_result = local_photo_processor.process_photo(photo_img, enhance=True, resize=False)
-                    photo_base64 = photo_result['base64']
-                    photo_quality = photo_result.get('quality_score', 0.5)
-                    cell_stats['photo_enhanced'] = 1
-                else:
-                    jpeg_buffer = io.BytesIO()
-                    photo_img.convert('RGB').save(jpeg_buffer, format='JPEG', quality=85)
-                    jpeg_bytes = jpeg_buffer.getvalue()
-                    photo_base64 = base64.b64encode(jpeg_bytes).decode('utf-8')
-                    photo_quality = 0.5
-            except:
-                photo_base64 = ""
-                photo_quality = 0.0
-        
-        # Strategy 3: Smart Detection
-        elif local_smart_detector:
-            try:
-                cell_rect = fitz.Rect(cell_x, cell_y, cell_x + cell_width_actual, cell_y + cell_height_actual)
-                cell_pix = page.get_pixmap(clip=cell_rect, dpi=200, alpha=False)
-                # FAST BUFFER CONVERSION
-                cell_img = Image.frombytes("RGB", [cell_pix.width, cell_pix.height], cell_pix.samples)
-                
-                smart_result = local_smart_detector.find_photo_in_cell(cell_img)
-                if smart_result['found']:
-                    photo_base64 = smart_result['photo_base64']
-                    photo_quality = smart_result['confidence']
-                    cell_stats['smart_photo_found'] = 1
-            except:
-                pass
+                    else:
+                        jpeg_buffer = io.BytesIO()
+                        photo_img.convert('RGB').save(jpeg_buffer, format='JPEG', quality=85)
+                        jpeg_bytes = jpeg_buffer.getvalue()
+                        photo_base64 = base64.b64encode(jpeg_bytes).decode('utf-8')
+                        photo_quality = 0.5
+                except:
+                    photo_base64 = ""
+                    photo_quality = 0.0
+            
+            # Strategy 3: Smart Detection
+            elif local_smart_detector:
+                try:
+                    cell_rect = fitz.Rect(cell_x, cell_y, cell_x + cell_width_actual, cell_y + cell_height_actual)
+                    cell_pix = page.get_pixmap(clip=cell_rect, dpi=200, alpha=False)
+                    # FAST BUFFER CONVERSION
+                    cell_img = Image.frombytes("RGB", [cell_pix.width, cell_pix.height], cell_pix.samples)
+                    
+                    smart_result = local_smart_detector.find_photo_in_cell(cell_img)
+                    if smart_result['found']:
+                        photo_base64 = smart_result['photo_base64']
+                        photo_quality = smart_result['confidence']
+                        cell_stats['smart_photo_found'] = 1
+                except:
+                    pass
         
         # === FINAL VERIFICATION: HIGH-POWER TEXT LAYER MATCHING (99% ACCURACY) ===
         # User requested maximum accuracy using CPU power to match PDF text layer with extracted data.
@@ -718,15 +728,26 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
 
         # Clean voter ID
         if voter_id_text:
-            voter_id_text = voter_id_text.rstrip('_').strip()
+            # Normalize: Uppercase and remove punctuation/spaces
+            voter_id_text = re.sub(r'[^A-Z0-9]', '', voter_id_text.upper())
             
-            # User Fix 1: Trim if more than 10 chars
+            # STRICT REQUIREMENT: ABC1234567 (10 chars: 3 Alpha + 7 Numeric)
             if len(voter_id_text) > 10:
                 voter_id_text = voter_id_text[:10]
             
-            # User Fix 2: 4th position 0 -> O fix (make sure it's 0)
-            if len(voter_id_text) >= 4 and voter_id_text[3] == 'O':
-                voter_id_text = voter_id_text[:3] + '0' + voter_id_text[4:]
+            # Apply format-specific fixes if we have exactly 10 characters
+            if len(voter_id_text) == 10:
+                # Ensure positions 1-3 are Alpha
+                prefix = voter_id_text[:3]
+                suffix = voter_id_text[3:]
+                
+                # Fix common OCR digit-to-letter errors in prefix
+                prefix = prefix.replace('0', 'O').replace('1', 'I').replace('2', 'Z').replace('5', 'S').replace('8', 'B')
+                
+                # Fix common OCR letter-to-digit errors in suffix
+                suffix = suffix.replace('O', '0').replace('I', '1').replace('L', '1').replace('S', '5').replace('G', '6').replace('B', '8').replace('Z', '2')
+                
+                voter_id_text = prefix + suffix
         
         # DEBUG: Log raw voter ID for troubleshooting
         print(f"      🔍 DEBUG Page {page_num+1}, Row {row+1}, Col {col+1}:")
@@ -833,10 +854,10 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                     # OPTIMIZATION: Crop from master image
                     cell_full_crop = None
                     if master_page_img:
-                        left = cell_full_rect.x1 * master_page_scale
-                        top = cell_full_rect.y1 * master_page_scale
-                        right = cell_full_rect.x2 * master_page_scale
-                        bottom = cell_full_rect.y2 * master_page_scale
+                        left = cell_full_rect.x0 * master_page_scale
+                        top = cell_full_rect.y0 * master_page_scale
+                        right = cell_full_rect.x1 * master_page_scale
+                        bottom = cell_full_rect.y1 * master_page_scale
                         cell_full_crop = master_page_img.crop((left, top, right, bottom))
 
                     ocr_res = local_ocr_processor.extract_full_cell_text(
@@ -863,20 +884,20 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
             try:
                 if master_page_img:
                     # Crop the cell from the master page image
-                    left = cell_rect.x1 * master_page_scale
-                    top = cell_rect.y1 * master_page_scale
-                    right = cell_rect.x2 * master_page_scale
-                    bottom = cell_rect.y2 * master_page_scale
+                    left = cell_full_rect.x0 * master_page_scale
+                    top = cell_full_rect.y0 * master_page_scale
+                    right = cell_full_rect.x1 * master_page_scale
+                    bottom = cell_full_rect.y1 * master_page_scale
                     master_cell_img = master_page_img.crop((left, top, right, bottom))
                     
                     px_scale_x = master_page_scale
                     px_scale_y = master_page_scale
                 else:
                     # Fallback to legacy behavior if master image missing
-                    master_cell_pix = page.get_pixmap(clip=cell_rect, dpi=250 if performance_mode == 'fast' else 300, alpha=False)
+                    master_cell_pix = page.get_pixmap(clip=cell_full_rect, dpi=250 if performance_mode == 'fast' else 300, alpha=False)
                     master_cell_img = Image.frombytes("RGB", [master_cell_pix.width, master_cell_pix.height], master_cell_pix.samples)
-                    px_scale_x = master_cell_pix.width / cell_rect.width
-                    px_scale_y = master_cell_pix.height / cell_rect.height
+                    px_scale_x = master_cell_pix.width / cell_full_rect.width
+                    px_scale_y = master_cell_pix.height / cell_full_rect.height
             except Exception as e:
                 print(f"      Warning: Master cell crop failed: {e}")
                 master_cell_img = None
@@ -1083,18 +1104,26 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                              gender_standard = TranslitHelper.map_gender(clean_val)
                              if gender_standard == "Male": clean_val = "पु"
                              elif gender_standard == "Female": clean_val = "स्री"
+
+                    # === SPECIAL HANDLING FOR HOUSE NO ===
+                    if 'house' in key_lower:
+                        # Remove colons and common labels from house number
+                        clean_val = re.sub(r'^(?:HOUSE|HS|NO|NUM)[:\- .]*', '', clean_val, flags=re.IGNORECASE)
+                        clean_val = re.sub(r'[:]', '', clean_val).strip()
                     # === SPECIAL HANDLING FOR SERIAL NO / ASSEMBLY NO ===
-                    if 'serial' in key_lower or 'assembly' in key_lower:
+                    if any(k in key_lower for k in ['serial', 'assembly', 'ac', 'pc', 'part']):
                         # Convert Marathi digits to English
                         marathi_digits = str.maketrans("०१२३४५६७८९", "0123456789")
                         clean_val = clean_val.translate(marathi_digits)
                         
-                        if 'assembly' in key_lower or 'part' in key_lower:
+                        if any(k in key_lower for k in ['assembly', 'part', 'ac', 'pc']):
                             # === ASSEMBLY / PART NUMBER CLEANING ===
                             # Fix OCR Typos first (Aggressive)
                             clean_val = clean_val.upper()
-                            # 1. Remove Labels
-                            clean_val = re.sub(r'^(?:ASSEMBLY|PART|AC|PC|NO|NUM)[ .:|\-\]]*', '', clean_val, flags=re.IGNORECASE)
+                            # 1. Remove Labels (Include fragments like A, P, AC, PC, and common OCR artifacts like leading digits)
+                            # Only strip if it's a clear label, not part of the number
+                            # Handles artifacts like "4 AC", "4Assembly", etc.
+                            clean_val = re.sub(r'^\s*(?:[0-9A-Z]*\s*)?(?:ASSEMBLY|PART|AC|PC|NO|NUM|A|P|ACNO)\b\s*[:.\- ]*', '', clean_val, flags=re.IGNORECASE)
                             
                             # 2. Fix OCR substitutions (O->0, I->1, S->5, etc.)
                             clean_val = clean_val.replace('O', '0').replace('D', '0').replace('Q', '0')
@@ -1121,8 +1150,10 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                                 # 1. Fix common alpha-digit OCR confusions UPPERCASE
                                 clean_val = clean_val.upper()
                                 
-                                # STEP A: Remove common LABELS
-                                clean_val = re.sub(r'^(?:S|SR|SL|NO|NUM|SERIAL|SER)[ .:|\-\]]*', '', clean_val, flags=re.IGNORECASE)
+                                # STEP A: Remove common LABELS (Be cautious with single letter 'S' to avoid stripping digit '2')
+                                clean_val = re.sub(r'^\s*(?:SR|SL|NO|NUM|SERIAL|SER)\b\s*[:.\- ]*', '', clean_val, flags=re.IGNORECASE)
+                                # Only strip single 'S' if followed by space or separator
+                                clean_val = re.sub(r'^\s*S\s+[:.\- ]*', '', clean_val, flags=re.IGNORECASE)
                                 clean_val = clean_val.strip()
     
                                 # Aggressive replacements for Serial Number field (strictly numeric)
@@ -1188,14 +1219,45 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                         additional_fields['serialNo'] = clean_val # Standard key
                     elif 'house' in key_lower:
                         additional_fields['houseNo'] = clean_val # Standard key
-                    elif 'assembly' in key_lower:
+                    elif any(k in key_lower for k in ['assembly', 'ac']):
                         additional_fields['assemblyNo'] = clean_val # Standard key
+                    elif any(k in key_lower for k in ['part', 'pc']):
+                        additional_fields['partNo'] = clean_val # Standard key
                     
                     print(f"         > {field_key}: '{clean_val}' (Rel: {additional_fields.get('relationType', 'N/A')})")
                     
                 except Exception as ex:
                     print(f"         > {field_key}: Error ({str(ex)})")
                     additional_fields[field_key] = ""
+        
+        # === SMART FALLBACK (MISALIGNED GRID PROTECTION) ===
+        # If critical fields are missing but full_text exists, parse from full_text
+        if full_text and (not additional_fields.get('name') or len(additional_fields.get('name', '')) < 2):
+            lines = [l.strip() for l in full_text.split('\n') if l.strip()]
+            for line in lines:
+                # Own Name is usually first line or follows 'नाव' label without relative prefixes
+                if any(k in line for k in ['नाव', 'नाम']) and not any(k in line for k in ['पती', 'वडिल', 'आई', 'इतर']):
+                    detected = re.sub(r'^(?:नाव|नाम)[:\- .]*', '', line).strip()
+                    if detected and len(detected) > 2:
+                        # Clean up colons from detected name
+                        detected = re.sub(r'[:]', '', detected).strip()
+                        additional_fields['name'] = TranslitHelper.correct_marathi_ocr(detected)
+                        additional_fields['nameEnglish'] = TranslitHelper.transliterate_marathi_to_english(additional_fields['name'])
+                        break
+
+        if full_text and (not additional_fields.get('relativeName') or len(additional_fields.get('relativeName', '')) < 2):
+            rel_prefixes = ['पतीचे', 'वडिलांचे', 'आईचे', 'इतर']
+            for prefix in rel_prefixes:
+                pattern = f'{prefix}\\s*(?:नाव|नाम)?[:\\- .]*(.*)'
+                match = re.search(pattern, full_text)
+                if match:
+                    detected = match.group(1).split('\n')[0].strip()
+                    if detected and len(detected) > 2:
+                        # Clean up colons from detected relative name
+                        detected = re.sub(r'[:]', '', detected).strip()
+                        additional_fields['relativeName'] = TranslitHelper.correct_marathi_ocr(detected)
+                        additional_fields['relativeNameEnglish'] = TranslitHelper.transliterate_marathi_to_english(additional_fields['relativeName'])
+                        break
 
         # === AI SMART CORRECTION (DISABLED) ===
         # if 'name' in additional_fields and 'relativeName' in additional_fields:
@@ -1379,27 +1441,25 @@ def is_cell_empty(pix_or_img, threshold=500):
     Returns True if empty.
     """
     try:
-        import cv2
-        import numpy as np
-        
-        # Convert to numpy array
+        # FAST PATH: PIL extremas
         if isinstance(pix_or_img, fitz.Pixmap):
-            img_bytes = pix_or_img.tobytes("png")
-            nparr = np.frombuffer(img_bytes, np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
-        else: # PIL Image
+            # Convert Pixmap to PIL for fast extrema check
+            img_pil = Image.frombytes("RGB", [pix_or_img.width, pix_or_img.height], pix_or_img.samples)
+            extrema = img_pil.convert('L').getextrema()
+            if extrema[1] - extrema[0] < 10: return True
+            img = np.array(img_pil.convert('L'))
+        elif isinstance(pix_or_img, Image.Image):
+            extrema = pix_or_img.convert('L').getextrema()
+            if extrema[1] - extrema[0] < 10: return True
             img = np.array(pix_or_img.convert('L'))
+        else:
+            return False
             
         # Threshold (Black text on white background)
-        # Inverted: Text becomes white (255), Background black (0)
         _, thresh = cv2.threshold(img, 200, 255, cv2.THRESH_BINARY_INV)
-        
-        # Count non-zero pixels (Ink)
         non_zero = cv2.countNonZero(thresh)
-        
         return non_zero < threshold
-    except Exception as e:
-        # Fallback: assume not empty if check fails
+    except:
         return False
 
 def detect_page_alignment(page, config, file_id=None):
@@ -1659,7 +1719,7 @@ def process_single_page_worker(task_info):
                     
                     # Valid Grid Criteria
                     if d_rows >= 2 and d_cols >= 2:
-                        print(f"      ✅ Auto-Grid Success: Found {d_rows}x{d_cols} grid (Page {page_num + 1})")
+                        # print(f"      ✅ Auto-Grid Success: Found {d_rows}x{d_cols} grid (Page {page_num + 1})")
                         
                         detected_grid = grid_info.get('grid', [])
                         
@@ -1762,12 +1822,14 @@ def process_single_page_worker(task_info):
         results = []
         
         # === PERFORMANCE OPTIMIZATION: RENDER PAGE ONCE ===
-        # Use a shared 300 DPI render for all extraction tasks (Header + Cells)
+        # Use a shared render for all extraction tasks (Header + Cells)
+        # Optimization: use 200 DPI in fast mode to speed up rendering and cropping
+        performance_mode = config.get('performanceMode', 'balanced')
+        render_dpi = 200 if performance_mode == 'fast' else 300
         master_page_img = None
-        master_page_scale = 300 / 72.0 
+        master_page_scale = render_dpi / 72.0 
         try:
-            # print(f"      🚀 Page Optimization: Rendering full page at 300 DPI once...")
-            page_pix = page.get_pixmap(dpi=300, alpha=False)
+            page_pix = page.get_pixmap(dpi=render_dpi, alpha=False)
             master_page_img = Image.frombytes("RGB", [page_pix.width, page_pix.height], page_pix.samples)
         except Exception as e:
             print(f"      ⚠️  Master page render failed: {e}")
@@ -1817,13 +1879,14 @@ def process_single_page_worker(task_info):
                             force_marathi=force_marathi_val 
                         )
                         
-                        # RULE: For booth fields, use raw text to keep it exactly "as it is" from OCR
+                        # RULE: For booth fields, use raw text + special cleaning for Z.P.
                         if is_booth_field:
                             val = field_res.get('raw_text', '').strip()
+                            val = TranslitHelper.clean_booth_info(val)
                         else:
                             val = field_res.get('text', '').strip()
-                            # CLEANUP: Remove common OCR garbage for standard fields
-                            val = re.sub(r'[|:;!॥\--]', '', val).strip()
+                            # CLEANUP: Remove common OCR garbage for standard fields, but be careful with digits
+                            val = re.sub(r'[|:;!॥\-]', '', val).strip()
                         
                         val = ' '.join(val.split())
                         
@@ -1878,7 +1941,7 @@ def process_single_page_worker(task_info):
                                  detected_val = match.group(1).split('\n')[0].strip()
                                  if len(detected_val) > 5:
                                      # print(f"      ✨ Smart Detected Booth Center: {detected_val}")
-                                     page_data['boothCenter'] = detected_val
+                                     page_data['boothCenter'] = TranslitHelper.clean_booth_info(detected_val)
                                      try:
                                          if re.search(r'[a-zA-Z]', detected_val):
                                              page_data['boothCenterEnglish'] = detected_val
@@ -1899,7 +1962,7 @@ def process_single_page_worker(task_info):
                                  detected_val = match.group(1).split('\n')[0].strip()
                                  if len(detected_val) > 5:
                                      # print(f"      ✨ Smart Detected Booth Address: {detected_val}")
-                                     page_data['boothAddress'] = detected_val
+                                     page_data['boothAddress'] = TranslitHelper.clean_booth_info(detected_val)
                                      try:
                                          if re.search(r'[a-zA-Z]', detected_val):
                                              page_data['boothAddressEnglish'] = detected_val
@@ -2216,14 +2279,10 @@ def process_page(pdf_path, page_num, config, template, box_detector_config=None)
                             force_marathi=force_marathi_val 
                         )
                         
-                        # RULE: For booth fields, use raw text to keep it exactly "as it is" from OCR
+                        # RULE: For booth fields, use raw text + special cleaning for Z.P.
                         if is_booth_field:
                             val = field_res.get('raw_text', '').strip()
-                            # FIX: Common Z.P. (Zilla Parishad) OCR errors
-                            # User reported 'z.p.' taken as '2,2'
-                            val = re.sub(r'\b2[,. ]+2\b', 'Z.P.', val)
-                            val = re.sub(r'\b2[,. ]+P\b', 'Z.P.', val)
-                            val = re.sub(r'\bZ[,. ]+2\b', 'Z.P.', val)
+                            val = TranslitHelper.clean_booth_info(val)
                         else:
                             val = field_res.get('text', '').strip()
                             # CLEANUP: Remove common OCR garbage for standard fields
@@ -2265,7 +2324,7 @@ def process_page(pdf_path, page_num, config, template, box_detector_config=None)
                                      # FIX: Common Z.P. OCR error
                                      det = re.sub(r'\b2[,. ]+2\b', 'Z.P.', det)
                                      det = re.sub(r'\b2[,. ]+P\b', 'Z.P.', det)
-                                     page_data['boothCenter'] = det
+                                     det = TranslitHelper.clean_booth_info(det); page_data['boothCenter'] = det
                                      try: 
                                          # RULE: Transliterate to English if Devanagari is present
                                          if any('\u0900' <= char <= '\u097F' for char in det):
@@ -2283,7 +2342,7 @@ def process_page(pdf_path, page_num, config, template, box_detector_config=None)
                                      # FIX: Common Z.P. OCR error
                                      det = re.sub(r'\b2[,. ]+2\b', 'Z.P.', det)
                                      det = re.sub(r'\b2[,. ]+P\b', 'Z.P.', det)
-                                     page_data['boothAddress'] = det
+                                     det = TranslitHelper.clean_booth_info(det); page_data['boothAddress'] = det
                                      try: 
                                          # RULE: Transliterate to English if Devanagari is present
                                          if any('\u0900' <= char <= '\u097F' for char in det):
@@ -2454,16 +2513,11 @@ def extract_grid_vertical_enhanced(pdf_bytes, config, pdf_path=None):
         
         # Sort results by Serial No primarily, fallback to physical order
         def get_sort_key(x):
-            try:
-                # Try common Serial No keys
-                s = x.get('serialNo') or x.get('Serial No') or x.get('serial_no') or ''
-                # Extract ONLY digits for numeric sort
-                digits = ''.join(c for c in str(s) if c.isdigit())
-                if digits:
-                    return (0, int(digits)) # Priority 0: Numeric Serial No found
-            except Exception:
-                pass
-            # Priority 1: Fallback to physical layout order
+            s = x.get('serialNo')
+            if s and isinstance(s, str):
+                # Faster numeric extraction
+                digits = "".join(filter(str.isdigit, s))
+                if digits: return (0, int(digits))
             return (1, x.get('page', 0), x.get('column', 0), x.get('row', 0))
 
         extracted_data.sort(key=get_sort_key)

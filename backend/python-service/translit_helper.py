@@ -3,6 +3,9 @@ from indic_transliteration.sanscript import transliterate
 import re
 
 class TranslitHelper:
+    # Use simple cache for transliteration to speed up performance
+    _translit_cache = {}
+
     # Specific OCR correction map for common Marathi name/surname confusions
     MARATHI_CORRECTIONS = {
         'ठोळके': 'शेळके',
@@ -42,6 +45,62 @@ class TranslitHelper:
     RE_WADI = re.compile(r'([ा-ो])वा(ची|चि)\b')
 
     @staticmethod
+    def clean_booth_info(text):
+        """
+        Cleans booth info text from OCR artifacts.
+        Corrects '2' or '9' or other numeric misreads for 'Z.P.'
+        """
+        if not text:
+            return ""
+        
+        # 1. Standardize whitespace
+        text = ' '.join(text.split()).strip()
+        
+        # 2. Specific English/Marathi misread corrections (Common OCR errors)
+        # Fix '800' -> 'Bhor'
+        text = re.sub(r'\b800\b', 'Bhor', text)
+        # Fix '28' -> 'Zilla' if near school keywords
+        text = re.sub(r'\b28\b(?=\s*(?:जि|प|प्रा|shala|school|pri|pra|केंद्र))', 'Zilla', text, flags=re.IGNORECASE)
+        # Fix 'He' -> 'Kendra' (Common OCR misread for केंद्र or के.)
+        text = re.sub(r'\bHe[.]?\b', 'Kendra', text)
+        # Fix 'पब' -> 'पु' (if it slipped into here)
+        text = text.replace('पब', 'पु')
+        
+        # 3. Keywords indicating Zila Parishad schools
+        # English and Marathi variants
+        school_keywords = ['pri', 'pra', 'school', 'shala', 'primary', 'प्रा', 'प्राथ', 'शाळा', 'केंद्र']
+        
+        # 4. Handle suspicious starts followed by school keywords
+        # User reported 2 or 9 replacing Z.P.
+        # Pattern: Starting with 2, 9, 8, 0, Z, etc. followed by a school keyword
+        target_kws_pattern = '|'.join([re.escape(k) for k in school_keywords])
+        
+        # Case 1: Suspicious leading chars + keyword
+        # Corrects: "2 pri school" -> "Z.P. pri school", "9 pra. school" -> "Z.P. pra. school"
+        sus_pattern = r'^([2980Zz\.\s,]+)\s+(?=' + target_kws_pattern + ')'
+        if re.search(sus_pattern, text, re.IGNORECASE):
+            text = re.sub(sus_pattern, 'Z.P. ', text, count=1, flags=re.IGNORECASE)
+        
+        # 5. Case 2: Direct numeric fragments that look like Z.P.
+        # "2.2" -> "Z.P.", "2,2" -> "Z.P.", "2 P" -> "Z.P."
+        text = re.sub(r'\b2[,. ]+2\b', 'Z.P.', text)
+        text = re.sub(r'\b2[,. ]+P\b', 'Z.P.', text, flags=re.IGNORECASE)
+        text = re.sub(r'\bZ[,. ]+2\b', 'Z.P.', text, flags=re.IGNORECASE)
+        text = re.sub(r'\b9[,. ]+P\b', 'Z.P.', text, flags=re.IGNORECASE)
+        text = re.sub(r'\b9[,. ]+2\b', 'Z.P.', text, flags=re.IGNORECASE)
+        text = re.sub(r'\bZ[,. ]+P\b', 'Z.P.', text, flags=re.IGNORECASE)
+        
+        # 6. Case 3: Specific Marathi Ji.Pa. (जि.प.) misreads
+        # If it starts with 2 or 9 and then Marathi school keywords
+        mar_kws = ['प्रा', 'प्राथ', 'शाळा', 'केंद्र']
+        mar_target = '|'.join(mar_kws)
+        mar_sus = r'^([2980])\s+(?=' + mar_target + ')'
+        if re.search(mar_sus, text):
+            text = re.sub(mar_sus, 'जि.प. ', text, count=1)
+
+        return text.strip()
+
+    @staticmethod
     def correct_marathi_ocr(text):
         """
         Corrects specific Marathi OCR misidentifications.
@@ -70,11 +129,14 @@ class TranslitHelper:
         text = TranslitHelper.RE_THOLKE.sub(r'शे\1', text)
         
         # General fix for Shaikh (शेख) misidentifications
-        # User reported 'hokh' specifically.
-        # We handle variations with optional spaces between characters.
-        text = TranslitHelper.RE_SHAIKH.sub('शेख', text)
+        text = re.sub(r'[होखोलोसोशो]ख', 'शेख', text)
         
-        return text
+        # 3. General cleaning for names (Remove colons and leading garbage)
+        # remove ":" automatically if the grid misalligned
+        text = re.sub(r'^[:\- .]*', '', text)
+        text = re.sub(r'[:]', '', text) # Global colon removal
+        
+        return text.strip()
 
     @staticmethod
     def transliterate_marathi_to_english(text):
@@ -85,6 +147,11 @@ class TranslitHelper:
         if not text:
             return ""
         
+        # Performance Cache Check
+        if text in TranslitHelper._translit_cache:
+            return TranslitHelper._translit_cache[text]
+        
+        original_text = text
         # Correct OCR errors in Marathi source first
         text = TranslitHelper.correct_marathi_ocr(text)
         
@@ -138,19 +205,26 @@ class TranslitHelper:
             elif t_word.lower() == 'pavar':
                 t_word = 'Pawar'
                 
-            # Fix 'Ri' for vocalic R (ऋ)
-            t_word = t_word.replace('RRi', 'Ri')
-            
+            # Specific name correction: 'JNaneshVar' -> 'Dnyneshwar' as requested
+            if 'jnaneshvar' in t_word_lower or 'jnaneshwar' in t_word_lower:
+                t_word = 'Dnyneshwar'
+            elif 'jnyaneshwar' in t_word_lower:
+                t_word = 'Dnyneshwar'
+                
             # Capitalize
             t_word = t_word.title()
             
             # Clean non-ASCII (except spaces and brackets if needed)
-            # Keeping brackets for (H)
+            # Clean non-ASCII (except spaces and brackets if needed)
             t_word = re.sub(r'[^a-zA-Z0-9\(\)]', '', t_word)
             
             transliterated_words.append(t_word)
             
-        return " ".join(transliterated_words).strip()
+        result = " ".join(transliterated_words).strip()
+        
+        # Save to cache before returning
+        TranslitHelper._translit_cache[original_text] = result
+        return result
 
     @staticmethod
     def map_gender(marathi_gender):
@@ -158,13 +232,12 @@ class TranslitHelper:
             return ""
         m_gender = str(marathi_gender).strip().upper()
         
-        # Marathi & Hindi Gender Keywords
-        # Male keywords: पु, पुरुष (Hindi/Marathi)
-        if any(k in m_gender for k in ['पम', 'पर', 'पु', 'पुरुष', 'PURUSH', 'MALE', 'PURS']):
+        # Male keywords: पु, पब (OCR error), पुरुष (Hindi/Marathi)
+        if any(k in m_gender for k in ['पब', 'पम', 'पर', 'पु', 'पुरुष', 'PURUSH', 'MALE', 'PURS']):
              return "Male"
         
-        # Female keywords: स्री, स्त्री, महिला (Hindi), सत, सद
-        if any(k in m_gender for k in ['सद', 'सत', 'स्री', 'स्त्री', 'महिला', 'MAHILA', 'FEMALE', 'STRI']):
+        # Female keywords: स्री, स्त्री, सण (OCR error), महिला (Hindi), सत, सद
+        if any(k in m_gender for k in ['सण', 'सद', 'सत', 'स्री', 'स्त्री', 'महिला', 'MAHILA', 'FEMALE', 'STRI']):
              return "Female"
         
         return ""
