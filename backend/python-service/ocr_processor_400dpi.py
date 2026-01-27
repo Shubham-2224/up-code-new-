@@ -15,8 +15,6 @@ try:
     from paddle_ocr_processor import PaddleOCRProcessor
     PADDLE_PROCESSOR_AVAILABLE = True
 except ImportError:
-    PADDLE_PROCESSOR_AVAILABLE = True
-except ImportError:
     PADDLE_PROCESSOR_AVAILABLE = False
     # print("WARNING: PaddleOCR Processor module not found")
 
@@ -71,12 +69,37 @@ class OCRProcessor400DPI:
         if self.quality_mode == 'fast':
             self.max_retries = 1  # Minimal retries for speed
             self.min_confidence_threshold = 0.6
+            self.enable_char_processing = False # Disable individual char OCR
+            self.enable_paddle_fallback = False # Use Tesseract primarily if fast
         elif self.quality_mode == 'balanced':
             self.max_retries = 2  # Moderate retries
             self.min_confidence_threshold = 0.4
+            self.enable_char_processing = False # Still disable for balanced
+            self.enable_paddle_fallback = True  # Enable for better Marathi
         else:  # accurate
             self.max_retries = 3  # Maximum retries for accuracy
             self.min_confidence_threshold = 0.3
+            self.enable_char_processing = True  # Only for accurate
+            self.enable_paddle_fallback = True
+
+    def set_quality_mode(self, mode: str):
+        """Update quality mode and related flags"""
+        self.quality_mode = mode
+        if mode == 'fast':
+            self.max_retries = 1
+            self.min_confidence_threshold = 0.6
+            self.enable_char_processing = False
+            self.enable_paddle_fallback = False
+        elif mode == 'balanced':
+            self.max_retries = 2
+            self.min_confidence_threshold = 0.4
+            self.enable_char_processing = False
+            self.enable_paddle_fallback = True
+        else:
+            self.max_retries = 3
+            self.min_confidence_threshold = 0.3
+            self.enable_char_processing = True
+            self.enable_paddle_fallback = True
 
 
         print("OK: OCR Processor initialized with 300 DPI (EPIC-optimized)")
@@ -577,8 +600,8 @@ class OCRProcessor400DPI:
                     processing_steps.append(f"Failed {description}: {str(e)}")
                     continue
 
-            # Step 7: If no good result, try character-level processing
-            if best_result['confidence'] < 0.7:
+            # Step 7: If no good result, try character-level processing (SLOW)
+            if self.enable_char_processing and best_result['confidence'] < 0.7:
                 char_result = self._process_epic_characters(image)
                 if char_result and char_result['confidence'] > best_result['confidence']:
                     best_result = char_result

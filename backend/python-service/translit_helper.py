@@ -27,6 +27,11 @@ class TranslitHelper:
         'होष': 'शेख',
         'होप': 'शेख',
         'होाख': 'शेख',
+        'माटेवाची': 'माटेवाडी',
+        'नाटेवाची': 'माटेवाडी',
+        'माटेवाचि': 'माटेवाडी',
+        'वाची': 'वाडी',
+        'वाचि': 'वाडी',
     }
 
     # Pre-compiled regex for speed
@@ -34,6 +39,7 @@ class TranslitHelper:
     RE_THOLKE = re.compile(r'\bठो(ळके)\b')
     RE_RISHI = re.compile(r'क्रषि')
     RE_ASHVI = re.compile(r'आशिव(ि|इ)?')
+    RE_WADI = re.compile(r'([ा-ो])वा(ची|चि)\b')
 
     @staticmethod
     def correct_marathi_ocr(text):
@@ -50,6 +56,9 @@ class TranslitHelper:
                 text = text.replace(wrong, right)
         
         # 2. Pattern-based correction for common OCR confusions
+        
+        # Fix 'वाची/वाचि' -> 'वाडी' (Place name suffixes)
+        text = TranslitHelper.RE_WADI.sub(r'\1वाडी', text)
         
         # Fix 'क्रषि' -> 'ऋषि'
         text = TranslitHelper.RE_RISHI.sub('ऋषि', text)

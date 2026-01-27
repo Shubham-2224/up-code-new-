@@ -242,10 +242,19 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                 if VERBOSE_OCR_LOGS:
                     print(f"      📄 Strategy 1: OCR {local_ocr_processor.dpi} DPI ({performance_mode} mode)...")
 
+                # OPTIMIZATION: Crop directly from master_page_img if available
+                voter_id_crop = None
+                if master_page_img:
+                    left = voter_id_rect.x1 * master_page_scale
+                    top = voter_id_rect.y1 * master_page_scale
+                    right = voter_id_rect.x2 * master_page_scale
+                    bottom = voter_id_rect.y2 * master_page_scale
+                    voter_id_crop = master_page_img.crop((left, top, right, bottom))
+
                 result = local_ocr_processor.extract_voter_id(
-                    image=None,
-                    pdf_page=page,
-                    rect=voter_id_rect
+                    image=voter_id_crop,
+                    pdf_page=None if voter_id_crop else page,
+                    rect=None if voter_id_crop else voter_id_rect
                 )
 
                 voter_id_text = result.get('voter_id', '')
@@ -265,13 +274,14 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                     cell_stats['ocr_400dpi_local'] = 1
                 
                 # RETRY LOGIC: If first attempt failed or low confidence, try again with higher DPI
-                if (not voter_id_text or len(voter_id_text.strip()) < 3 or voter_id_confidence < 0.7):
+                # SKIP RETRY IN FAST MODE to save significant time
+                if performance_mode != 'fast' and (not voter_id_text or len(voter_id_text.strip()) < 3 or voter_id_confidence < 0.7):
                     if VERBOSE_OCR_LOGS:
                         print(f"      🔄 OCR Retry: First attempt failed/low confidence (conf={voter_id_confidence:.2f})")
-                        print(f"      📄 Strategy 2: 600 DPI with enhanced preprocessing...")
+                        print(f"      📄 Strategy 2: 450 DPI with enhanced preprocessing...")
                     
                     try:
-                        # Extract with HIGHER DPI (450) - Lowered from 600 for speed
+                        # Extract with HIGHER DPI (450)
                         voter_id_pix = page.get_pixmap(clip=voter_id_rect, dpi=450, alpha=False)
                         
                         # FAST CONVERSION: Avoid PNG encode/decode overhead
@@ -763,13 +773,19 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
             skip_reason = f"No valid voter ID (got: '{voter_id_text}')"
             print(f"         → Decision: SKIP ({skip_reason})")
         
-        # USER REQUEST 2026-01-17: STRICT FILTERING
-        # "skip the cell which do not contain the voter id"
-        # Overwrite previous logic: If NO Voter ID, SKIP (even if photo exists)
-        if not has_valid_voter_id:
+        # USER REQUEST 2026-01-27: REMOVE STRICT FILTERING
+        # User wants ALL data extracted, even without voter ID.
+        # We only skip if there's absolutely no data at all (handled below).
+        
+        # Check if we have ANY meaningful data
+        has_any_data = has_photo or has_valid_voter_id or (voter_id_text and len(voter_id_text.strip()) > 0)
+        
+        if has_any_data:
+            should_skip = False
+            skip_reason = ""
+        else:
             should_skip = True
-            skip_reason = f"STRICT MODE: No valid voter ID (got: '{voter_id_text}')"
-            print(f"         → Decision: SKIP ({skip_reason}) - Ignoring Photo presence due to strict mode")
+            skip_reason = "No data found (no photo, no voter ID)"
 
         # Log the final decision
         if should_skip:
@@ -814,10 +830,20 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                 print(f"      📄 No digital Marathi text found. Using Intelligent OCR...")
                 
                 if local_ocr_processor:
+                    # OPTIMIZATION: Crop from master image
+                    cell_full_crop = None
+                    if master_page_img:
+                        left = cell_full_rect.x1 * master_page_scale
+                        top = cell_full_rect.y1 * master_page_scale
+                        right = cell_full_rect.x2 * master_page_scale
+                        bottom = cell_full_rect.y2 * master_page_scale
+                        cell_full_crop = master_page_img.crop((left, top, right, bottom))
+
                     ocr_res = local_ocr_processor.extract_full_cell_text(
-                        image=None,
-                        pdf_page=page,
-                        rect=cell_full_rect
+                        image=cell_full_crop,
+                        pdf_page=None if cell_full_crop else page,
+                        rect=None if cell_full_crop else cell_full_rect,
+                        fast_preprocess=(performance_mode == 'fast')
                     )
                     full_text = ocr_res.get('text', '')
                     text_method = ocr_res.get('method', 'ocr_error')
@@ -831,20 +857,28 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
         fields_config = cell_template.get('fields', {})
         
         if local_ocr_processor and fields_config:
-            # === OPTIMIZATION: BATCH RENDER CELL ONCE ===
-            # Instead of rendering every small field (expensive I/O), render the whole cell once
-            # and crop from memory.
+            # === OPTIMIZATION: USE MASTER PAGE IMAGE CROP ===
+            # Instead of rendering every small field or cell (expensive I/O), 
+            # we use the master_page_img rendered once per page.
             try:
-                # 300 DPI is optimal balance as per user request
-                master_cell_pix = page.get_pixmap(clip=cell_rect, dpi=300, alpha=False)
-                master_cell_img = Image.frombytes("RGB", [master_cell_pix.width, master_cell_pix.height], master_cell_pix.samples)
-                
-                # Calculate scale factors to map PDF coordinates to Image pixels
-                # master_cell_pix.width (px) / cell_rect.width (points)
-                px_scale_x = master_cell_pix.width / cell_rect.width
-                px_scale_y = master_cell_pix.height / cell_rect.height
+                if master_page_img:
+                    # Crop the cell from the master page image
+                    left = cell_rect.x1 * master_page_scale
+                    top = cell_rect.y1 * master_page_scale
+                    right = cell_rect.x2 * master_page_scale
+                    bottom = cell_rect.y2 * master_page_scale
+                    master_cell_img = master_page_img.crop((left, top, right, bottom))
+                    
+                    px_scale_x = master_page_scale
+                    px_scale_y = master_page_scale
+                else:
+                    # Fallback to legacy behavior if master image missing
+                    master_cell_pix = page.get_pixmap(clip=cell_rect, dpi=250 if performance_mode == 'fast' else 300, alpha=False)
+                    master_cell_img = Image.frombytes("RGB", [master_cell_pix.width, master_cell_pix.height], master_cell_pix.samples)
+                    px_scale_x = master_cell_pix.width / cell_rect.width
+                    px_scale_y = master_cell_pix.height / cell_rect.height
             except Exception as e:
-                print(f"      Warning: Master cell render failed: {e}")
+                print(f"      Warning: Master cell crop failed: {e}")
                 master_cell_img = None
 
             print(f"      🔍 Extracting {len(fields_config)} configured fields...")
@@ -1740,6 +1774,10 @@ def process_single_page_worker(task_info):
 
         # === EXTRACT PAGE LEVEL FIELDS (Booth Info) ===
         page_data = {}
+        # New constant fields from config
+        page_data['prabhag'] = config.get('prabhag', '')
+        page_data['boothNo'] = config.get('boothNo', '')
+
         page_template = config.get('pageTemplate', {})
         
         if page_template and processors.get('ocr'):
@@ -1779,19 +1817,27 @@ def process_single_page_worker(task_info):
                             force_marathi=force_marathi_val 
                         )
                         
-                        val = field_res.get('text', '').strip()
+                        # RULE: For booth fields, use raw text to keep it exactly "as it is" from OCR
+                        if is_booth_field:
+                            val = field_res.get('raw_text', '').strip()
+                        else:
+                            val = field_res.get('text', '').strip()
+                            # CLEANUP: Remove common OCR garbage for standard fields
+                            val = re.sub(r'[|:;!॥\--]', '', val).strip()
                         
-                        # CLEANUP: Remove common OCR garbage
-                        val = re.sub(r'[|:;!॥\--]', '', val).strip()
                         val = ' '.join(val.split())
                         
                         page_data[field_key] = val
                         
-                        # Populate English variant if missing
+                        # Populate English variant
                         if val:
                             try:
-                                english_val = TranslitHelper.transliterate_marathi_to_english(val)
-                                page_data[f"{field_key}English"] = english_val
+                                # RULE: If the field already contains English characters, use it directly
+                                if re.search(r'[a-zA-Z]', val):
+                                    page_data[f"{field_key}English"] = val
+                                else:
+                                    english_val = TranslitHelper.transliterate_marathi_to_english(val)
+                                    page_data[f"{field_key}English"] = english_val
                             except:
                                 page_data[f"{field_key}English"] = ""
                                 
@@ -1817,7 +1863,7 @@ def process_single_page_worker(task_info):
                          force_marathi=False
                      )
                      
-                     header_text = header_res.get('text', '')
+                     header_text = header_res.get('raw_text', '')
                      if header_text:
                          # Look for Booth Center keywords: "मतदान केंद्राचे नाव", "Polling Station Name"
                          # Logic: Usually the text AFTER the label is the value
@@ -1834,7 +1880,10 @@ def process_single_page_worker(task_info):
                                      # print(f"      ✨ Smart Detected Booth Center: {detected_val}")
                                      page_data['boothCenter'] = detected_val
                                      try:
-                                         page_data['boothCenterEnglish'] = TranslitHelper.transliterate_marathi_to_english(detected_val)
+                                         if re.search(r'[a-zA-Z]', detected_val):
+                                             page_data['boothCenterEnglish'] = detected_val
+                                         else:
+                                             page_data['boothCenterEnglish'] = TranslitHelper.transliterate_marathi_to_english(detected_val)
                                      except: pass
                                      break
                          
@@ -1852,7 +1901,10 @@ def process_single_page_worker(task_info):
                                      # print(f"      ✨ Smart Detected Booth Address: {detected_val}")
                                      page_data['boothAddress'] = detected_val
                                      try:
-                                         page_data['boothAddressEnglish'] = TranslitHelper.transliterate_marathi_to_english(detected_val)
+                                         if re.search(r'[a-zA-Z]', detected_val):
+                                             page_data['boothAddressEnglish'] = detected_val
+                                         else:
+                                             page_data['boothAddressEnglish'] = TranslitHelper.transliterate_marathi_to_english(detected_val)
                                      except: pass
                                      break
                  except: pass
@@ -1940,6 +1992,9 @@ def process_page(pdf_path, page_num, config, template, box_detector_config=None)
              WORKER_OCR = OCRProcessor400DPI()
              
         local_ocr_processor = WORKER_OCR
+        # Update quality mode based on config
+        performance_mode = config.get('performanceMode', 'balanced')
+        local_ocr_processor.set_quality_mode(performance_mode)
         
         # Use Cached Box Detector
         local_box_detector = None
@@ -2106,16 +2161,29 @@ def process_page(pdf_path, page_num, config, template, box_detector_config=None)
         page_results = []
         
         # === PERFORMANCE OPTIMIZATION: RENDER PAGE ONCE ===
+        # Choose DPI based on performance mode
+        performance_mode = config.get('performanceMode', 'balanced')
+        if performance_mode == 'fast':
+            render_dpi = 250
+        elif performance_mode == 'balanced':
+            render_dpi = 300
+        else:
+            render_dpi = 400
+            
         master_page_img = None
-        master_page_scale = 400 / 72.0  # Workers use 400 DPI
+        master_page_scale = render_dpi / 72.0
         try:
-            page_pix = page.get_pixmap(dpi=400, alpha=False)
+            page_pix = page.get_pixmap(dpi=render_dpi, alpha=False)
             master_page_img = Image.frombytes("RGB", [page_pix.width, page_pix.height], page_pix.samples)
         except Exception as e:
             print(f"      ⚠️  Master page render failed in worker: {e}")
 
         # === EXTRACT PAGE LEVEL FIELDS (Booth Info) ===
         page_data = {}
+        # New constant fields from config
+        page_data['prabhag'] = config.get('prabhag', '')
+        page_data['boothNo'] = config.get('boothNo', '')
+        
         page_template = config.get('pageTemplate', {})
         
         if page_template and processors.get('ocr'):
@@ -2148,17 +2216,31 @@ def process_page(pdf_path, page_num, config, template, box_detector_config=None)
                             force_marathi=force_marathi_val 
                         )
                         
-                        val = field_res.get('text', '').strip()
-                        # CLEANUP: Remove common OCR garbage
-                        val = re.sub(r'[|:;!॥\--]', '', val).strip()
+                        # RULE: For booth fields, use raw text to keep it exactly "as it is" from OCR
+                        if is_booth_field:
+                            val = field_res.get('raw_text', '').strip()
+                            # FIX: Common Z.P. (Zilla Parishad) OCR errors
+                            # User reported 'z.p.' taken as '2,2'
+                            val = re.sub(r'\b2[,. ]+2\b', 'Z.P.', val)
+                            val = re.sub(r'\b2[,. ]+P\b', 'Z.P.', val)
+                            val = re.sub(r'\bZ[,. ]+2\b', 'Z.P.', val)
+                        else:
+                            val = field_res.get('text', '').strip()
+                            # CLEANUP: Remove common OCR garbage for standard fields
+                            val = re.sub(r'[|:;!॥\--]', '', val).strip()
+                            
                         val = ' '.join(val.split())
                         
                         page_data[field_key] = val
                         
                         if val:
                             try:
-                                english_val = TranslitHelper.transliterate_marathi_to_english(val)
-                                page_data[f"{field_key}English"] = english_val
+                                # RULE: Transliterate to English if Devanagari is present
+                                if any('\u0900' <= char <= '\u097F' for char in val):
+                                     english_val = TranslitHelper.transliterate_marathi_to_english(val)
+                                     page_data[f"{field_key}English"] = english_val
+                                else:
+                                     page_data[f"{field_key}English"] = val
                             except:
                                 page_data[f"{field_key}English"] = ""
                     except Exception as e:
@@ -2167,13 +2249,12 @@ def process_page(pdf_path, page_num, config, template, box_detector_config=None)
              # === SMART FALLBACK: Search for missing booth info if not found via template ===
              if (not page_data.get('boothCenter') or len(page_data.get('boothCenter', '')) < 5) and master_page_img:
                  try:
+                     # OPTIMIZATION: Use master image instead of rendering again
                      header_h = int(page.rect.height * 0.15)
-                     header_rect = fitz.Rect(0, 0, page.rect.width, header_h)
-                     header_pix = page.get_pixmap(clip=header_rect, dpi=200, alpha=False)
-                     header_img = Image.frombytes("RGB", [header_pix.width, header_pix.height], header_pix.samples)
+                     header_img = master_page_img.crop((0, 0, int(page.rect.width * master_page_scale), int(header_h * master_page_scale)))
                      
                      header_res = processors['ocr'].extract_full_cell_text(image=header_img, force_marathi=False)
-                     header_text = header_res.get('text', '')
+                     header_text = header_res.get('raw_text', '')
                      if header_text:
                          # Booth Center patterns
                          for p in [r'(?:मतदान केंद्राचे नाव|नाम|नाव)\s*[:\-]*\s*(.*)', r'(?:Polling Station Name|Station Name)\s*[:\-]*\s*(.*)']:
@@ -2181,8 +2262,16 @@ def process_page(pdf_path, page_num, config, template, box_detector_config=None)
                              if m:
                                  det = m.group(1).split('\n')[0].strip()
                                  if len(det) > 5:
+                                     # FIX: Common Z.P. OCR error
+                                     det = re.sub(r'\b2[,. ]+2\b', 'Z.P.', det)
+                                     det = re.sub(r'\b2[,. ]+P\b', 'Z.P.', det)
                                      page_data['boothCenter'] = det
-                                     try: page_data['boothCenterEnglish'] = TranslitHelper.transliterate_marathi_to_english(det)
+                                     try: 
+                                         # RULE: Transliterate to English if Devanagari is present
+                                         if any('\u0900' <= char <= '\u097F' for char in det):
+                                             page_data['boothCenterEnglish'] = TranslitHelper.transliterate_marathi_to_english(det)
+                                         else:
+                                             page_data['boothCenterEnglish'] = det
                                      except: pass
                                      break
                          # Booth Address patterns
@@ -2191,8 +2280,16 @@ def process_page(pdf_path, page_num, config, template, box_detector_config=None)
                              if m:
                                  det = m.group(1).split('\n')[0].strip()
                                  if len(det) > 5:
+                                     # FIX: Common Z.P. OCR error
+                                     det = re.sub(r'\b2[,. ]+2\b', 'Z.P.', det)
+                                     det = re.sub(r'\b2[,. ]+P\b', 'Z.P.', det)
                                      page_data['boothAddress'] = det
-                                     try: page_data['boothAddressEnglish'] = TranslitHelper.transliterate_marathi_to_english(det)
+                                     try: 
+                                         # RULE: Transliterate to English if Devanagari is present
+                                         if any('\u0900' <= char <= '\u097F' for char in det):
+                                             page_data['boothAddressEnglish'] = TranslitHelper.transliterate_marathi_to_english(det)
+                                         else:
+                                             page_data['boothAddressEnglish'] = det
                                      except: pass
                                      break
                  except: pass
@@ -2205,7 +2302,9 @@ def process_page(pdf_path, page_num, config, template, box_detector_config=None)
                 cell_info=cell_info,
                 config=config,
                 extraction_limits=extraction_limits, 
-                processors=processors
+                processors=processors,
+                master_page_img=master_page_img,
+                master_page_scale=master_page_scale
             )
             
             if result and not result.get('skipped'):
@@ -2281,8 +2380,13 @@ def extract_grid_vertical_enhanced(pdf_bytes, config, pdf_path=None):
             'cellTemplate': config.get('cellTemplate', {}),
             'pageTemplate': config.get('pageTemplate', {}),
             'skipHeaderHeight': config.get('skipHeaderHeight', 0),
-            'skipFooterHeight': config.get('skipFooterHeight', 0)
+            'skipFooterHeight': config.get('skipFooterHeight', 0),
+            'prabhag': config.get('prabhag', '') or config.get('Prabhag', ''), # Handle case variants
+            'boothNo': config.get('boothNo', '') or config.get('BoothNo', ''), # Handle case variants
+            'performanceMode': config.get('performanceMode', 'balanced')
         }
+        
+        print(f"      DEBUG: Passing Prabhag='{worker_config['prabhag']}', BoothNo='{worker_config['boothNo']}' to workers")
         
         # PREPARE TASKS BY PAGE
         work_items = []

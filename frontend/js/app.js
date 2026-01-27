@@ -30,6 +30,8 @@ const elements = {
     skipPagesEnd: document.getElementById('skipPagesEnd'),
     skipHeaderHeight: document.getElementById('skipHeaderHeight'),
     skipFooterHeight: document.getElementById('skipFooterHeight'),
+    prabhag: document.getElementById('prabhag'),
+    boothNo: document.getElementById('boothNo'),
     btnShowSkipZones: document.getElementById('btnShowSkipZones'),
 
     // Grid
@@ -345,6 +347,8 @@ async function handleExtract() {
             skipPagesEnd: parseInt(elements.skipPagesEnd.value) || 0,
             skipHeaderHeight: (parseInt(elements.skipHeaderHeight.value) || 0) / pdfScale,
             skipFooterHeight: (parseInt(elements.skipFooterHeight.value) || 0) / pdfScale,
+            prabhag: elements.prabhag.value.trim(),
+            boothNo: elements.boothNo.value.trim(),
             grid: gridConfig,
             cellTemplate: cellTemplate,
             pageTemplate: gridOverlay.getPageTemplate(), // Include page template
@@ -576,6 +580,8 @@ function handlePreview() {
                 <td>${record.page || '-'}</td>
                 <td>${record.row || '-'}</td>
                 <td>${record.column || '-'}</td>
+                <td>${record.prabhag || '-'}</td>
+                <td>${record.boothNo || '-'}</td>
                 <td>${record.serialNo || '-'}</td>
                 <td class="voter-id-cell">${record.voterID || '<span class="no-data">No ID</span>'}</td>
                 <td>${record.name || '-'}</td>

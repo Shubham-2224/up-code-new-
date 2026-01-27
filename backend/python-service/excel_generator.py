@@ -28,7 +28,8 @@ def generate_excel(data: List[Dict], output_path: str) -> bool:
         
         # Define headers
         headers = [
-            'Serial No', 'EPIC No', 
+            'Serial No', 
+            'EPIC No', 
             'Name', 'Name (English)', 
             'Relation Type', 
             'Relative Name', 'Relative Name (English)', 
@@ -37,6 +38,7 @@ def generate_excel(data: List[Dict], output_path: str) -> bool:
             'Age', 'Assembly No',
             'Booth Center', 'Booth Center (English)',
             'Booth Address', 'Booth Address (English)',
+            'Prabhag', 'Booth No',
             'Base64 Image String'
         ]
         
@@ -70,7 +72,9 @@ def generate_excel(data: List[Dict], output_path: str) -> bool:
         worksheet.column_dimensions['M'].width = 30  # Booth Center (Eng)
         worksheet.column_dimensions['N'].width = 30  # Booth Address
         worksheet.column_dimensions['O'].width = 30  # Booth Address (Eng)
-        worksheet.column_dimensions['P'].width = 25  # Base64
+        worksheet.column_dimensions['P'].width = 15  # Prabhag
+        worksheet.column_dimensions['Q'].width = 15  # Booth No
+        worksheet.column_dimensions['R'].width = 25  # Base64
         
         # Define border style
         thin_border = Border(
@@ -118,6 +122,8 @@ def generate_excel(data: List[Dict], output_path: str) -> bool:
                 record.get('boothCenterEnglish', ''),
                 record.get('boothAddress', ''),
                 record.get('boothAddressEnglish', ''),
+                record.get('prabhag', ''),
+                record.get('boothNo', ''),
                 record.get('image_base64', '')
             ]
             
