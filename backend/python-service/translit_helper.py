@@ -233,7 +233,7 @@ class TranslitHelper:
         m_gender = str(marathi_gender).strip().upper()
         
         # Male keywords: पु, पब (OCR error), पुरुष (Hindi/Marathi)
-        if any(k in m_gender for k in ['पब', 'पम', 'पर', 'पु', 'पुरुष', 'PURUSH', 'MALE', 'PURS']):
+        if any(k in m_gender for k in ['पन', 'पक', 'पक्', 'पू', 'पब', 'पम', 'पर', 'पु', 'पुरुष', 'PURUSH', 'MALE', 'PURS']):
              return "Male"
         
         # Female keywords: स्री, स्त्री, सण (OCR error), महिला (Hindi), सत, सद

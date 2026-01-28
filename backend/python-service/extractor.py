@@ -955,8 +955,8 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                         if 'serial' in key_lower and not any(c.isdigit() for c in layer_text):
                              use_layer_text = False # Serial must have digits
                         
-                        # EXCEPTION: Only Name and Relative Name using Image Processing (User Request for Speed)
-                        if 'name' in key_lower or 'relative' in key_lower or 'relation' in key_lower:
+                        # EXCEPTION: Name, Relative Name, and Gender using Image Processing (User Request for Accuracy)
+                        if 'name' in key_lower or 'relative' in key_lower or 'relation' in key_lower or 'gender' in key_lower:
                              use_layer_text = False
 
                     if use_layer_text:
@@ -1095,7 +1095,7 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                          clean_val = re.sub(r'[^\w\s\u0900-\u097F]', '', clean_val).strip()
 
                          # FIX SPECIFIC OCR ERRORS: Replace incorrect gender extractions with correct values
-                         if clean_val in ['2 पक', 'पक', '2पक', '2 प', 'प', '2', 'पक्']:
+                         if any(k in clean_val for k in ['पन', 'पक', '2 पक', '2पक', '2 प', 'प', '2', 'पक्', 'पू', 'पम', 'पर']):
                              clean_val = "पु"  # Replace with correct Male gender (पु)
                          elif clean_val in ['स्री', 'स्त्री', 'महिला', 'स्री.', 'स्त्री.']:
                              clean_val = "स्री"  # Ensure Female gender is properly formatted
