@@ -26,8 +26,15 @@ def generate_excel(data: List[Dict], output_path: str) -> bool:
         worksheet = workbook.active
         worksheet.title = 'Voter Data'
         
-        # Determine if we should include the image column
-        include_images = any(record.get('image_base64') for record in data)
+        # Determine all image columns
+        include_main_image = any(record.get('image_base64') for record in data)
+        additional_image_keys = set()
+        for record in data:
+            for key in record.keys():
+                if key.endswith('_image'):
+                    additional_image_keys.add(key)
+        
+        sorted_image_keys = sorted(list(additional_image_keys))
         
         # Define base headers
         headers = [
@@ -44,44 +51,35 @@ def generate_excel(data: List[Dict], output_path: str) -> bool:
             'Prabhag', 'Booth No'
         ]
         
-        if include_images:
+        if include_main_image:
             headers.append('Base64 Image String')
+        
+        for key in sorted_image_keys:
+            # Format header name
+            header_name = key.replace('_', ' ').title()
+            headers.append(header_name)
         
         # Apply styling to headers
         header_font = Font(bold=True, size=12, color='FFFFFFFF')
         header_fill = PatternFill(start_color='FF4472C4', end_color='FF4472C4', fill_type='solid')
         header_alignment = Alignment(horizontal='center', vertical='center')
- 
+  
         worksheet.append(headers) 
- 
-        # Style header row
+  
+        # Style header row and set column widths
         for col_num in range(1, len(headers) + 1):
             cell = worksheet.cell(row=1, column=col_num)
             cell.font = header_font
             cell.fill = header_fill
             cell.alignment = header_alignment
-        
-        # Set column widths
-        worksheet.column_dimensions['A'].width = 10  # Serial
-        worksheet.column_dimensions['B'].width = 15  # EPIC
-        worksheet.column_dimensions['C'].width = 25  # Name
-        worksheet.column_dimensions['D'].width = 25  # Name (English)
-        worksheet.column_dimensions['E'].width = 15  # Relation Type
-        worksheet.column_dimensions['F'].width = 25  # Relative Name
-        worksheet.column_dimensions['G'].width = 25  # Relative Name (English)
-        worksheet.column_dimensions['H'].width = 10  # House
-        worksheet.column_dimensions['I'].width = 8   # Gender
-        worksheet.column_dimensions['J'].width = 6   # Age
-        worksheet.column_dimensions['K'].width = 12  # Assembly
-        worksheet.column_dimensions['L'].width = 30  # Booth Center
-        worksheet.column_dimensions['M'].width = 30  # Booth Center (Eng)
-        worksheet.column_dimensions['N'].width = 30  # Booth Address
-        worksheet.column_dimensions['O'].width = 30  # Booth Address (Eng)
-        worksheet.column_dimensions['P'].width = 15  # Prabhag
-        worksheet.column_dimensions['Q'].width = 15  # Booth No
-        
-        if include_images:
-            worksheet.column_dimensions['R'].width = 25  # Base64
+            
+            # Set default widths for standard columns, then auto for images
+            col_letter = get_column_letter(col_num)
+            if col_num <= 17:
+                standard_widths = [10, 15, 25, 25, 15, 25, 25, 10, 8, 8, 12, 30, 30, 30, 30, 15, 15]
+                worksheet.column_dimensions[col_letter].width = standard_widths[col_num-1]
+            else:
+                worksheet.column_dimensions[col_letter].width = 25 # Image B64 columns
         
         # Define border style
         thin_border = Border(
@@ -92,17 +90,14 @@ def generate_excel(data: List[Dict], output_path: str) -> bool:
         )
         
         # Sort data by Serial No before writing
-        # Use helper to convert Serial No to integer for correct sorting
         def get_serial_key(rec):
             try:
                 val = rec.get('serialNo') or rec.get('Serial No') or rec.get('serial_no') or ''
-                # Extract only digits in case OCR left artifacts
                 digits = ''.join(c for c in str(val) if c.isdigit())
                 if digits:
-                    return (0, int(digits)) # Priority 0: Numeric Serial
+                    return (0, int(digits))
             except:
                 pass
-            # Fallback to physical order if Serial No is missing or invalid
             return (1, rec.get('page', 0), rec.get('column', 0), rec.get('row', 0))
 
         data.sort(key=get_serial_key)
@@ -113,7 +108,6 @@ def generate_excel(data: List[Dict], output_path: str) -> bool:
             
             # Prepare row values in order
             row_values = [
-                # Check multiple key variations for Serial No
                 record.get('serialNo') or record.get('Serial No') or record.get('serial_no') or '',
                 record.get('voterID', ''),
                 record.get('name', ''),
@@ -133,8 +127,11 @@ def generate_excel(data: List[Dict], output_path: str) -> bool:
                 record.get('boothNo', '')
             ]
 
-            if include_images:
+            if include_main_image:
                 row_values.append(record.get('image_base64', ''))
+            
+            for key in sorted_image_keys:
+                row_values.append(record.get(key, ''))
             
             # Write row
             worksheet.append(row_values)

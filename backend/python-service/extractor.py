@@ -224,7 +224,7 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                 if VERBOSE_OCR_LOGS:
                     print(f"      ⚠️  Text layer extraction error: {str(e)}")
         
-        # Strategy 1: Use 400 DPI OCR Processor (if text layer failed)
+        # Strategy 1: Use Enhanced 400+ DPI OCR Processor
         if (not voter_id_text or len(voter_id_text.strip()) < 3) and local_ocr_processor and voter_id_box:
             try:
                 scaled_voter_id_x = voter_id_box.get('x', 0) * scale_x
@@ -240,18 +240,19 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                 )
                 
                 if VERBOSE_OCR_LOGS:
-                    print(f"      📄 Strategy 1: OCR {local_ocr_processor.dpi} DPI ({performance_mode} mode)...")
+                    print(f"      📄 Strategy 1: Enhanced EPIC Processing (500 DPI internal)...")
 
-                # OPTIMIZATION: Crop directly from master_page_img if available
+                # Use Master Page Scaling for precision
                 voter_id_crop = None
-                if master_page_img:
-                    left = voter_id_rect.x0 * master_page_scale
-                    top = voter_id_rect.y0 * master_page_scale
-                    right = voter_id_rect.x1 * master_page_scale
-                    bottom = voter_id_rect.y1 * master_page_scale
+                if master_page_img and master_page_scale:
+                    left = max(0, int(voter_id_rect.x0 * master_page_scale) - 2)
+                    top = max(0, int(voter_id_rect.y0 * master_page_scale) - 2)
+                    right = min(master_page_img.width, int(voter_id_rect.x1 * master_page_scale) + 2)
+                    bottom = min(master_page_img.height, int(voter_id_rect.y1 * master_page_scale) + 2)
                     voter_id_crop = master_page_img.crop((left, top, right, bottom))
 
-                result = local_ocr_processor.extract_voter_id(
+                # Use the ADVANCED method directly for Voter ID
+                result = local_ocr_processor.extract_epic_with_advanced_image_processing(
                     image=voter_id_crop,
                     pdf_page=None if voter_id_crop else page,
                     rect=None if voter_id_crop else voter_id_rect
@@ -259,206 +260,41 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
 
                 voter_id_text = result.get('voter_id', '')
                 voter_id_confidence = result.get('confidence', 0.0)
-                voter_id_method = result.get('method', 'unknown')
+                voter_id_method = result.get('method', 'advanced_epic')
 
-                # Early success check based on performance mode
-                min_confidence = local_ocr_processor.min_confidence_threshold
-                if voter_id_confidence >= min_confidence and voter_id_text:
+                if voter_id_text:
                     if VERBOSE_OCR_LOGS:
-                        print(f"      ✅ {performance_mode.upper()} MODE: Early success with conf={voter_id_confidence:.2f}")
-                    cell_stats['ocr_400dpi'] = 1
-                    # Skip to final processing
-                    voter_id_text = voter_id_text if voter_id_text else ""
+                        print(f"      ✅ Advanced EPIC Success: '{voter_id_text}' (conf={voter_id_confidence:.2f})")
+                    cell_stats['ocr_advanced_voter_id'] = 1
                 
-                if voter_id_method == 'tesseract':
-                    cell_stats['ocr_400dpi_local'] = 1
-                
-                # RETRY LOGIC: If first attempt failed or low confidence, try again with higher DPI
-                # SKIP RETRY IN FAST MODE to save significant time
-                if performance_mode != 'fast' and (not voter_id_text or len(voter_id_text.strip()) < 3 or voter_id_confidence < 0.7):
-                    if VERBOSE_OCR_LOGS:
-                        print(f"      🔄 OCR Retry: First attempt failed/low confidence (conf={voter_id_confidence:.2f})")
-                        print(f"      📄 Strategy 2: 450 DPI with enhanced preprocessing...")
-                    
-                    try:
-                        # Extract with HIGHER DPI (450)
-                        voter_id_pix = page.get_pixmap(clip=voter_id_rect, dpi=450, alpha=False)
-                        
-                        # FAST CONVERSION: Avoid PNG encode/decode overhead
-                        if voter_id_pix.n < 4:
-                            voter_id_img = Image.frombytes("RGB", [voter_id_pix.width, voter_id_pix.height], voter_id_pix.samples)
-                        else:
-                             voter_id_img = Image.frombytes("RGB", [voter_id_pix.width, voter_id_pix.height], voter_id_pix.samples)
-
-                        # Enhanced preprocessing for retry
-                        from PIL import ImageEnhance, ImageFilter
-                        
-                        # Convert to grayscale
-                        voter_id_img = voter_id_img.convert('L')
-                        
-                        # Increase contrast more aggressively
-                        enhancer = ImageEnhance.Contrast(voter_id_img)
-                        voter_id_img = enhancer.enhance(2.5)
-                        
-                        # Sharpen
-                        enhancer = ImageEnhance.Sharpness(voter_id_img)
-                        voter_id_img = enhancer.enhance(2.0)
-                        
-                        # Denoise
-                        voter_id_img = voter_id_img.filter(ImageFilter.MedianFilter(size=3))
-                        
-                        # Try multiple PSM modes with EARLY EXIT
-                        retry_texts = []
-                        best_retry_confidence = 0.0
-                        
-                        for psm_mode in [6, 7, 8, 11, 13]:  # Try MORE page segmentation modes
-                            try:
-                                retry_raw_text = pytesseract.image_to_string(
-                                    voter_id_img,
-                                    lang='eng+hin',
-                                    config=f'--psm {psm_mode} --oem 3'
-                                ).strip()
-                                
-                                if retry_raw_text:
-                                    retry_texts.append(retry_raw_text)
-                                    
-                                    # EARLY EXIT: If we found a good result, stop trying other modes!
-                                    curr_result = local_ocr_processor._extract_voter_id_from_text(retry_raw_text)
-                                    if curr_result[0] and len(curr_result[0].strip()) >= 10 and curr_result[1] > 0.85:
-                                        if VERBOSE_OCR_LOGS:
-                                            print(f"      ⚡ Fast Match (PSM {psm_mode}): '{curr_result[0]}' (conf={curr_result[1]:.2f})")
-                                        break
-                            except:
-                                pass
-                        
-                        # Use the result
-                        if retry_texts:
-                            # Re-extract and find best
-                            final_retry_voter_id = ""
-                            final_retry_confidence = 0.0
-                            
-                            for text in retry_texts:
-                                res = local_ocr_processor._extract_voter_id_from_text(text)
-                                if res[1] > final_retry_confidence:
-                                    final_retry_confidence = res[1]
-                                    final_retry_voter_id = res[0]
-
-                            # Use retry result if it's better
-                            if final_retry_voter_id and len(final_retry_voter_id.strip()) >= 3:
-                                if final_retry_confidence > voter_id_confidence or not voter_id_text:
-                                    if VERBOSE_OCR_LOGS:
-                                        print(f"      ✅ Strategy 2 SUCCESS: '{final_retry_voter_id}' (conf={final_retry_confidence:.2f})")
-                                    voter_id_text = final_retry_voter_id
-                                    voter_id_confidence = final_retry_confidence
-                                    voter_id_method = 'tesseract_retry_600dpi'
-                                    cell_stats['ocr_retry_600dpi'] = 1
-                                else:
-                                    if VERBOSE_OCR_LOGS:
-                                        print(f"      ⚠️  Strategy 2 result not better: '{final_retry_voter_id}' (conf={final_retry_confidence:.2f})")
-                            else:
-                                if VERBOSE_OCR_LOGS:
-                                    print(f"      ❌ Strategy 2 failed: No valid voter ID found")
-                    except Exception as retry_error:
-                        if VERBOSE_OCR_LOGS:
-                            print(f"      ❌ Strategy 2 error: {str(retry_error)}")
-                
-                # ULTRA-AGGRESSIVE FALLBACK: If still failed (or low confidence), try MAXIMUM quality
-                # OPTIMIZATION: Only run if confidence is really low (< 0.75) to save time
-                if (not voter_id_text or len(voter_id_text.strip()) < 3 or voter_id_confidence < 0.75):
-                    if VERBOSE_OCR_LOGS:
+                # If still failed or low confidence, try Strategy 3 (Ultra-Aggressive)
+                if (not voter_id_text or voter_id_confidence < 0.7) and performance_mode != 'fast':
+                     if VERBOSE_OCR_LOGS:
                         print(f"      🔥 ULTRA-AGGRESSIVE FALLBACK: Trying MAXIMUM quality extraction...")
-                        print(f"      📄 Strategy 3: 800 DPI + ALL PSM modes + Multiple preprocessing...")
-                    
-                    try:
-                        # Extract with HIGH DPI (500) - Lowered from 800 for speed
-                        # 500 DPI with Binarization is often better than 800 DPI raw
-                        voter_id_pix_ultra = page.get_pixmap(clip=voter_id_rect, dpi=500, alpha=False)
-                        # FAST BUFFER CONVERSION
-                        voter_id_img_ultra = Image.frombytes("RGB", [voter_id_pix_ultra.width, voter_id_pix_ultra.height], voter_id_pix_ultra.samples)
-                        
-                        from PIL import ImageEnhance, ImageFilter, ImageOps
-                        
-                        # Try MULTIPLE preprocessing variants
-                        preprocessing_variants = []
-                        
-                        # Variant 1: High contrast + sharp
-                        img1 = voter_id_img_ultra.convert('L')
-                        img1 = ImageEnhance.Contrast(img1).enhance(3.0)
-                        img1 = ImageEnhance.Sharpness(img1).enhance(2.5)
-                        preprocessing_variants.append(('high_contrast', img1))
-                        
-                        # Variant 2: Inverted (white text on black)
-                        img2 = voter_id_img_ultra.convert('L')
-                        img2 = ImageOps.invert(img2)
-                        img2 = ImageEnhance.Contrast(img2).enhance(2.0)
-                        preprocessing_variants.append(('inverted', img2))
-                        
-                        # Variant 3: Threshold (binary)
-                        img3 = voter_id_img_ultra.convert('L')
-                        img3 = img3.point(lambda x: 0 if x < 128 else 255, '1')
-                        preprocessing_variants.append(('threshold', img3))
-                        
-                        # Variant 4: Adaptive threshold
-                        img4 = voter_id_img_ultra.convert('L')
-                        img4 = ImageEnhance.Contrast(img4).enhance(2.0)
-                        img4 = img4.filter(ImageFilter.SHARPEN)
-                        preprocessing_variants.append(('adaptive', img4))
-                        
-                        # Try ALL PSM modes on ALL preprocessing variants WITH EARLY EXIT!
-                        best_ultra_result = None
-                        best_ultra_confidence = 0.0
-                        found_good_match = False
-                        
-                        psm_modes = [3, 4, 6, 7, 8, 11, 12, 13]  # ALL useful PSM modes
-                        
-                        for variant_name, variant_img in preprocessing_variants:
-                            if found_good_match: break
-                            
-                            for psm_mode in psm_modes:
-                                try:
-                                    ultra_raw_text = pytesseract.image_to_string(
-                                        variant_img,
-                                        lang='eng+hin',
-                                        config=f'--psm {psm_mode} --oem 3'
-                                    ).strip()
-                                    
-                                    if ultra_raw_text:
-                                        # Check right away!
-                                        ultra_result = local_ocr_processor._extract_voter_id_from_text(ultra_raw_text)
-                                        ultra_voter_id = ultra_result[0]
-                                        ultra_confidence = ultra_result[1]
-                                        
-                                        if ultra_voter_id and len(ultra_voter_id.strip()) >= 10:
-                                            # Keep track of best
-                                            if ultra_confidence > best_ultra_confidence:
-                                                best_ultra_result = (variant_name, psm_mode, ultra_voter_id, ultra_confidence)
-                                                best_ultra_confidence = ultra_confidence
-                                            
-                                            # EARLY EXIT: If confidence is high, STOP searching!
-                                            if ultra_confidence > 0.90:
-                                                if VERBOSE_OCR_LOGS:
-                                                    print(f"      ⚡ Fast Match (Ultra): {variant_name} + PSM {psm_mode} -> (conf={ultra_confidence:.2f})")
-                                                found_good_match = True
-                                                break
-                                except:
-                                    pass
-                            
-                        if best_ultra_result:
-                            variant_name, psm_mode, ultra_voter_id, ultra_confidence = best_ultra_result
-                            if VERBOSE_OCR_LOGS:
-                                print(f"      ✅ ULTRA-FALLBACK SUCCESS: '{ultra_voter_id}' (conf={ultra_confidence:.2f})")
-                                print(f"         Best: {variant_name} preprocessing + PSM {psm_mode}")
-                            voter_id_text = ultra_voter_id
-                            voter_id_confidence = ultra_confidence
-                            voter_id_method = 'tesseract_ultra_800dpi'
-                            cell_stats['ocr_ultra_800dpi'] = 1
-                        else:
-                            if VERBOSE_OCR_LOGS:
-                                print(f"      ❌ ULTRA-FALLBACK: No valid voter ID found in up to 32 attempts")
-                    except Exception as ultra_error:
-                        if VERBOSE_OCR_LOGS:
-                            print(f"      ❌ ULTRA-FALLBACK error: {str(ultra_error)}")
-                
+                     
+                     voter_id_pix_ultra = page.get_pixmap(clip=voter_id_rect, dpi=500, alpha=False)
+                     voter_id_img_ultra = Image.frombytes("RGB", [voter_id_pix_ultra.width, voter_id_pix_ultra.height], voter_id_pix_ultra.samples)
+                     
+                     # Try multiple binarization thresholds
+                     best_ultra_text = ""
+                     best_ultra_conf = 0.0
+                     
+                     for threshold in [100, 128, 160]:
+                         bin_img = voter_id_img_ultra.convert('L').point(lambda x: 0 if x < threshold else 255, '1')
+                         for psm in [7, 8, 6]:
+                             t_res = pytesseract.image_to_string(bin_img, lang='eng', config=f'--psm {psm} --oem 3').strip()
+                             if t_res:
+                                 v_match = local_ocr_processor._validate_epic_format(t_res)
+                                 if v_match and v_match['confidence'] > best_ultra_conf:
+                                     best_ultra_conf = v_match['confidence']
+                                     best_ultra_text = v_match['epic']
+                         if best_ultra_conf > 0.9: break
+                     
+                     if best_ultra_text and best_ultra_conf > voter_id_confidence:
+                         voter_id_text = best_ultra_text
+                         voter_id_confidence = best_ultra_conf
+                         voter_id_method = 'ultra_aggressive_fallback'
+                         cell_stats['ocr_ultra_fallback'] = 1
             except Exception as e:
                 if VERBOSE_OCR_LOGS:
                     print(f"      ❌ OCR error: {str(e)}")
@@ -970,13 +806,16 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                     else:
                         # SLOW PATH: Image Extraction + OCR
                         # OPTIMIZATION: Use Master Page Image if available (SUPER FAST)
+                        crop_img = None
                         if master_page_img and master_page_scale:
                             try:
                                 # Calculate crop coordinates in master_page_img pixels
-                                crop_x = int(field_rect.x0 * master_page_scale)
-                                crop_y = int(field_rect.y0 * master_page_scale)
-                                crop_w = int(field_rect.width * master_page_scale)
-                                crop_h = int(field_rect.height * master_page_scale)
+                                offset_x = 1 # Small offset to avoid border lines
+                                offset_y = 1
+                                crop_x = int(field_rect.x0 * master_page_scale) + offset_x
+                                crop_y = int(field_rect.y0 * master_page_scale) + offset_y
+                                crop_w = int(field_rect.width * master_page_scale) - (2 * offset_x)
+                                crop_h = int(field_rect.height * master_page_scale) - (2 * offset_y)
                                 
                                 # Ensure we don't go out of bounds
                                 img_w, img_h = master_page_img.size
@@ -988,37 +827,48 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                                 crop_img = master_page_img.crop((crop_x, crop_y, crop_x + crop_w, crop_y + crop_h))
                             except Exception as e:
                                 print(f"      Warning: Master page crop failed: {e}")
-                                crop_img = None
                                 
                         # OPTIMIZATION: Use Master Cell Crop as fallback
-                        elif master_cell_img:
+                        if not crop_img and master_cell_img:
                             try:
                                 # Calculate relative coordinates inside the cell
-                                rel_x = field_rect.x0 - cell_rect.x0
-                                rel_y = field_rect.y0 - cell_rect.y0
+                                rel_x = field_rect.x0 - cell_full_rect.x0
+                                rel_y = field_rect.y0 - cell_full_rect.y0
                                 rel_w = field_rect.width
                                 rel_h = field_rect.height
                                 
                                 # Convert to Pixels
-                                crop_x = int(rel_x * px_scale_x)
-                                crop_y = int(rel_y * px_scale_y)
-                                crop_w = int(rel_w * px_scale_x)
-                                crop_h = int(rel_h * px_scale_y)
+                                c_x = int(rel_x * px_scale_x)
+                                c_y = int(rel_y * px_scale_y)
+                                c_w = int(rel_w * px_scale_x)
+                                c_h = int(rel_h * px_scale_y)
                                 
-                                # Crop
-                                crop_img = master_cell_img.crop((crop_x, crop_y, crop_x + crop_w, crop_y + crop_h))
+                                crop_img = master_cell_img.crop((c_x, c_y, c_x + c_w, c_y + c_h))
                             except Exception as e:
-                                crop_img = None
+                                pass
 
-                        # Use FAST PREPROCESS if we are using a digital crop
-                        use_fast_pipeline = (crop_img is not None)
-                        
+                        # EXTRACT IMAGE FOR THIS FIELD (User Request: "Proper images of selected parts")
+                        if crop_img:
+                            try:
+                                # Store as base64 for the user to see - ALWAYS extract as image if part of template
+                                # (Reduced quality to avoid excessive memory but high enough for readability)
+                                b64_buffer = io.BytesIO()
+                                crop_img.convert('RGB').save(b64_buffer, format='JPEG', quality=85)
+                                field_image_b64 = base64.b64encode(b64_buffer.getvalue()).decode('utf-8')
+                                additional_fields[f"{field_key}_image"] = field_image_b64
+                                # Also store in standard key for compatibility
+                                if 'photo' in key_lower:
+                                    photo_base64 = field_image_b64
+                            except:
+                                pass
+
+                        # Run OCR
                         field_res = local_ocr_processor.extract_full_cell_text(
                             image=crop_img,
-                            pdf_page=page if not crop_img else None, # Only fallback to page render if crop failed
+                            pdf_page=page if not crop_img else None,
                             rect=field_rect if not crop_img else None,
                             force_marathi=force_marathi,
-                            fast_preprocess=use_fast_pipeline
+                            fast_preprocess=(performance_mode == 'fast')
                         )
                     
                     raw_text = field_res.get('raw_text', '').strip()

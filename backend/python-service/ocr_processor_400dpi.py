@@ -490,7 +490,7 @@ class OCRProcessor400DPI:
         - Morphological operations for character enhancement
         - Adaptive thresholding optimized for text regions
         - Noise reduction while preserving character edges
-        - Character segmentation and validation
+        - Multiple PSM modes for best results
 
         Args:
             image: PIL Image or None
@@ -503,7 +503,7 @@ class OCRProcessor400DPI:
         try:
             # Extract high-quality image if pdf_page and rect provided
             if pdf_page and rect:
-                pix = pdf_page.get_pixmap(clip=rect, dpi=self.dpi, alpha=False)
+                pix = pdf_page.get_pixmap(clip=rect, dpi=500, alpha=False)
                 image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
             if not image:
@@ -515,128 +515,115 @@ class OCRProcessor400DPI:
                     'processing_steps': []
                 }
 
-            # Performance optimization: Check cache first
+            # Cache check
             cache_key = f"epic_advanced_{self._get_image_cache_key(image)}"
             if cache_key in self.image_cache:
                 return self.image_cache[cache_key].copy()
 
-            processing_steps = []
-
-            # === ADVANCED IMAGE PREPROCESSING FOR EPIC NUMBERS ===
-
-            # Step 1: Convert to grayscale and enhance contrast
-            if image.mode != 'L':
-                image = image.convert('L')
-            processing_steps.append("Converted to grayscale")
-
-            # ULTRA-FAST preprocessing based on quality mode
-            if self.quality_mode == 'fast':
-                # Minimal processing for speed
-                if CV2_AVAILABLE:
-                    img_cv = np.array(image)
-                    # Very fast bilateral filter with smaller kernel
-                    img_cv = cv2.bilateralFilter(img_cv, 3, 30, 30)
-                    image = Image.fromarray(img_cv)
-                else:
-                    # Simple contrast boost only
-                    enhancer = ImageEnhance.Contrast(image)
-                    image = enhancer.enhance(1.2)
-                processing_steps.append("Applied ultra-fast preprocessing")
-            elif CV2_AVAILABLE:
-                img_cv = np.array(image)
-                # Balanced processing
+            processing_variants = []
+            
+            # VARIANT 1: Standard Grayscale + Contrast
+            img1 = image.convert('L')
+            img1 = ImageEnhance.Contrast(img1).enhance(2.0)
+            img1 = ImageEnhance.Sharpness(img1).enhance(2.0)
+            processing_variants.append(('standard_enhanced', img1))
+            
+            # VARIANT 2: OpenCV Adaptive Threshold (if available)
+            if CV2_AVAILABLE:
+                img_cv = np.array(image.convert('L'))
                 img_cv = cv2.bilateralFilter(img_cv, 5, 50, 50)
-                clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(4, 4))
-                img_cv = clahe.apply(img_cv)
-                image = Image.fromarray(img_cv)
-                processing_steps.append("Applied balanced preprocessing")
-            else:
-                # Simple PIL enhancement
-                enhancer = ImageEnhance.Contrast(image)
-                image = enhancer.enhance(1.5)
-                processing_steps.append("Applied basic contrast enhancement")
+                binary = cv2.adaptiveThreshold(
+                    img_cv, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                    cv2.THRESH_BINARY, 11, 2
+                )
+                processing_variants.append(('adaptive_thresh', Image.fromarray(binary)))
+                
+                # VARIANT 3: Morphological opening (remove small noise)
+                kernel = np.ones((2,2), np.uint8)
+                opening = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+                processing_variants.append(('morph_opening', Image.fromarray(opening)))
+            
+            # VARIANT 4: Higher Contrast + Median Filter
+            img4 = image.convert('L')
+            img4 = img4.filter(ImageFilter.MedianFilter(size=3))
+            img4 = ImageEnhance.Contrast(img4).enhance(3.0)
+            processing_variants.append(('high_contrast_denoise', img4))
 
-            # Skip advanced binarization in fast mode
-            if self.quality_mode == 'fast':
-                pass  # Skip binarization for speed
-            else:
-                # Fallback to PIL binarization with dynamic threshold
-                # Calculate optimal threshold based on image histogram
-                histogram = image.histogram()
-                total_pixels = sum(histogram)
-                cumulative = 0
-                threshold = 128  # default
+            best_result = {'voter_id': '', 'confidence': 0.0, 'method': 'none', 'raw_text': '', 'processing_steps': []}
+            
+            # Try ALL variants with multiple PSM modes
+            psm_modes = [7, 8, 6, 11] # 7=single line, 8=single word, 6=block, 11=sparse text
+            
+            found_any = False
+            for var_name, var_img in processing_variants:
+                for psm in psm_modes:
+                    try:
+                        # White-listed characters for Voter ID
+                        t_config = f'--psm {psm} --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/'
+                        raw_text = pytesseract.image_to_string(var_img, lang='eng', config=t_config).strip()
+                        
+                        if raw_text:
+                            match = self._validate_epic_format(raw_text)
+                            if match:
+                                found_any = True
+                                # Add bonus for better PSM modes or specific formats
+                                current_conf = match['confidence']
+                                if psm == 7: current_conf += 0.05 # PSM 7 is usually best for IDs
+                                
+                                if current_conf > best_result['confidence']:
+                                    best_result = {
+                                        'voter_id': match['epic'],
+                                        'confidence': min(1.0, current_conf),
+                                        'method': f'epic_adv_{var_name}_psm{psm}',
+                                        'raw_text': raw_text,
+                                        'processing_steps': best_result.get('processing_steps', []) + [f"Found {match['epic']} with {var_name}/PSM{psm}"]
+                                    }
+                                    
+                                    # Early exit for very high confidence
+                                    if best_result['confidence'] > 0.95:
+                                        break
+                    except:
+                        continue
+                if best_result.get('confidence', 0.0) > 0.95:
+                    break
 
-                for i, count in enumerate(histogram):
-                    cumulative += count
-                    if cumulative > total_pixels * 0.5:  # 50% cumulative
-                        threshold = i
-                        break
-
-                image = image.point(lambda x: 0 if x < threshold else 255, '1')
-                processing_steps.append("Applied dynamic thresholding")
-
-            # Step 6: Extract text using optimized PSM mode for EPIC format
-            best_result = {'text': '', 'confidence': 0.0}
-            psm_configs = [
-                ('--psm 7 --oem 3', 'EPIC single line mode')  # Only try the most reliable mode
-            ]
-
-            for config, description in psm_configs:
-                try:
-                    raw_text = pytesseract.image_to_string(
-                        image,
-                        lang='eng',
-                        config=f'{config} -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-                    ).strip()
-
-                    if raw_text:
-                        # Validate if this looks like an EPIC number
-                        epic_match = self._validate_epic_format(raw_text)
-                        if epic_match and epic_match['confidence'] > best_result['confidence']:
-                            best_result = {
-                                'text': epic_match['epic'],
-                                'confidence': epic_match['confidence'],
-                                'method': f'advanced_{description}'
-                            }
-                            processing_steps.append(f"Tried {description}: '{raw_text}' → '{epic_match['epic']}'")
-
-                except Exception as e:
-                    processing_steps.append(f"Failed {description}: {str(e)}")
-                    continue
-
-            # Step 7: If no good result, try character-level processing (SLOW)
-            if self.enable_char_processing and best_result['confidence'] < 0.7:
+            # Fallback to character processing if still low confidence
+            if self.enable_char_processing and best_result['confidence'] < 0.7 and CV2_AVAILABLE:
                 char_result = self._process_epic_characters(image)
-                if char_result and char_result['confidence'] > best_result['confidence']:
-                    best_result = char_result
-                    processing_steps.append("Used character-level processing")
+                if char_result and char_result.get('confidence', 0) > best_result['confidence']:
+                    best_result = {
+                        'voter_id': char_result['text'],
+                        'confidence': char_result['confidence'],
+                        'method': 'character_level_processing',
+                        'raw_text': char_result.get('text', ''),
+                        'processing_steps': best_result.get('processing_steps', []) + ["Used character-level processing"]
+                    }
 
-            # Extract final EPIC number
-            voter_id = best_result['text']
-            confidence = best_result['confidence']
+            # Final cleanup and format enforcement
+            if best_result['voter_id']:
+                # Ensure proper format correction
+                vid = best_result['voter_id']
+                corrected_vid = self._correct_voter_id_format(vid)
+                best_result['voter_id'] = corrected_vid
 
-            # Apply format correction if needed
-            if voter_id:
-                voter_id = self._correct_voter_id_format(voter_id)
-
-            result = {
-                'voter_id': voter_id,
-                'confidence': confidence,
-                'method': 'advanced_image_processing',
-                'raw_text': best_result.get('text', ''),
-                'processing_steps': processing_steps
+            # Prepare final result dict
+            final_res = {
+                'voter_id': best_result['voter_id'],
+                'confidence': best_result['confidence'],
+                'method': best_result['method'],
+                'raw_text': best_result['raw_text'],
+                'processing_steps': best_result.get('processing_steps', [])
             }
 
-            # Cache the result
+            # Store in cache
             if len(self.image_cache) < self.cache_max_size:
-                self.image_cache[cache_key] = result.copy()
+                self.image_cache[cache_key] = final_res.copy()
 
-            # Success - no logging for performance
-            return result
+            return final_res
 
         except Exception as e:
-            result = {
+            print(f"      ERROR: Advanced EPIC processing failed: {str(e)}")
+            return {
                 'voter_id': '',
                 'confidence': 0.0,
                 'method': 'error',
@@ -644,13 +631,6 @@ class OCRProcessor400DPI:
                 'processing_steps': [],
                 'error': str(e)
             }
-
-            # Cache error result
-            if len(self.image_cache) < self.cache_max_size:
-                self.image_cache[cache_key] = result.copy()
-
-            print(f"      ERROR: Advanced EPIC processing failed: {str(e)}")
-            return result
 
     def _validate_epic_format(self, text: str) -> Dict:
         """
