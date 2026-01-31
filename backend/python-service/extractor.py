@@ -337,9 +337,17 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
         elif local_smart_detector:
             try:
                 cell_rect = fitz.Rect(cell_x, cell_y, cell_x + cell_width_actual, cell_y + cell_height_actual)
-                cell_pix = page.get_pixmap(clip=cell_rect, dpi=200, alpha=False)
-                # FAST BUFFER CONVERSION
-                cell_img = Image.frombytes("RGB", [cell_pix.width, cell_pix.height], cell_pix.samples)
+                
+                # OPTIMIZATION: Use master_page_img if available
+                if master_page_img:
+                    left = max(0, int(cell_rect.x0 * master_page_scale))
+                    top = max(0, int(cell_rect.y0 * master_page_scale))
+                    right = min(master_page_img.width, int(cell_rect.x1 * master_page_scale))
+                    bottom = min(master_page_img.height, int(cell_rect.y1 * master_page_scale))
+                    cell_img = master_page_img.crop((left, top, right, bottom))
+                else:
+                    cell_pix = page.get_pixmap(clip=cell_rect, dpi=200, alpha=False)
+                    cell_img = Image.frombytes("RGB", [cell_pix.width, cell_pix.height], cell_pix.samples)
                 
                 smart_result = local_smart_detector.find_voter_id_in_cell(cell_img)
                 if smart_result['found']:
@@ -445,9 +453,17 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
             elif local_smart_detector:
                 try:
                     cell_rect = fitz.Rect(cell_x, cell_y, cell_x + cell_width_actual, cell_y + cell_height_actual)
-                    cell_pix = page.get_pixmap(clip=cell_rect, dpi=200, alpha=False)
-                    # FAST BUFFER CONVERSION
-                    cell_img = Image.frombytes("RGB", [cell_pix.width, cell_pix.height], cell_pix.samples)
+                    
+                    # OPTIMIZATION: Use master_page_img if available
+                    if master_page_img:
+                        left = max(0, int(cell_rect.x0 * master_page_scale))
+                        top = max(0, int(cell_rect.y0 * master_page_scale))
+                        right = min(master_page_img.width, int(cell_rect.x1 * master_page_scale))
+                        bottom = min(master_page_img.height, int(cell_rect.y1 * master_page_scale))
+                        cell_img = master_page_img.crop((left, top, right, bottom))
+                    else:
+                        cell_pix = page.get_pixmap(clip=cell_rect, dpi=200, alpha=False)
+                        cell_img = Image.frombytes("RGB", [cell_pix.width, cell_pix.height], cell_pix.samples)
                     
                     smart_result = local_smart_detector.find_photo_in_cell(cell_img)
                     if smart_result['found']:
@@ -459,7 +475,8 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
         
         # === FINAL VERIFICATION: HIGH-POWER TEXT LAYER MATCHING (99% ACCURACY) ===
         # User requested maximum accuracy using CPU power to match PDF text layer with extracted data.
-        # We now use 'words' extraction to get precise coordinates of every text element.
+        # OPTIMIZATION: Skip deep verification if we already have a 100% match from text layer
+        # This saves massive CPU time on digital PDFs
         try:
             # Define cell verify rect
             cell_rect_verify = fitz.Rect(
@@ -469,9 +486,15 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                 cell_y + cell_height_actual
             )
             
-            # Extract ALL words with coordinates: (x0, y0, x1, y1, "word", block, line, word)
-            # This uses more CPU but gives perfect spatial awareness
-            cell_words = page.get_text("words", clip=cell_rect_verify)
+            # OPTIMIZATION: Skip deep verification if we already have a 100% match from text layer
+            if voter_id_confidence >= 0.99:
+                 if VERBOSE_OCR_LOGS:
+                     print(f"      ✨ Skipping Deep Verify (Already have perfect match via {voter_id_method})")
+                 cell_words = []
+            else:
+                # Extract ALL words with coordinates: (x0, y0, x1, y1, "word", block, line, word)
+                # This uses more CPU but gives perfect spatial awareness
+                cell_words = page.get_text("words", clip=cell_rect_verify)
             
             # Compile candidates with their metadata
             candidates = []

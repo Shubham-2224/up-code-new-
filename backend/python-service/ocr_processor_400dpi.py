@@ -551,8 +551,17 @@ class OCRProcessor400DPI:
 
             best_result = {'voter_id': '', 'confidence': 0.0, 'method': 'none', 'raw_text': '', 'processing_steps': []}
             
-            # Try ALL variants with multiple PSM modes
-            psm_modes = [7, 8, 6, 11] # 7=single line, 8=single word, 6=block, 11=sparse text
+            # Try variants with multiple PSM modes
+            psm_modes = [7, 8, 6, 11] # default
+            
+            # OPTIMIZATION: Reduce search space based on quality mode
+            if self.quality_mode == 'fast':
+                 # Fast mode: Limit to most effective variants/modes
+                 processing_variants = processing_variants[:2] # Only Standard + Adaptive
+                 psm_modes = [7, 6] 
+            elif self.quality_mode == 'balanced':
+                 processing_variants = processing_variants[:3]
+                 psm_modes = [7, 8, 6]
             
             found_any = False
             for var_name, var_img in processing_variants:
