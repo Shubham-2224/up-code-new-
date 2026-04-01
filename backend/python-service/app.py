@@ -1049,13 +1049,13 @@ if __name__ == '__main__':
 
     # Minimal startup banner for faster loading
     print("""
-╔════════════════════════════════════════════════╗
-║      Voter Extraction Service - Ready         ║
-╚════════════════════════════════════════════════╝
+--------------------------------------------------
+|      Voter Extraction Service - Ready         |
+--------------------------------------------------
 
-  🌐 http://localhost:5000  |  http://{ip}:5000
+  URL: http://localhost:5000  |  http://{ip}:5000
   
-  ✓ Ready to process requests
+  [OK] Ready to process requests
     """.format(ip=local_ip))
     
     # Suppress Flask startup messages for cleaner output
