@@ -1,8 +1,9 @@
-"""
-PaddleOCR Processor - Layout-aware OCR for Marathi/Devanagari
-"""
-
 import os
+import sys
+
+# ADD CUSTOM PORTABLE PATH (FOR WINDOWS LONG PATH WORKAROUND)
+if os.path.exists('C:\\p'):
+    sys.path.append('C:\\p')
 
 # Suppress PaddleOCR verbose output BEFORE import
 os.environ['GLOG_minloglevel'] = '3'  # Suppress PaddlePaddle C++ logs

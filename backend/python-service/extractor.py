@@ -751,26 +751,41 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                     f_w = field_box.get('width', 0) * scale_x
                     f_h = field_box.get('height', 0) * scale_y
                     
-                    field_rect = fitz.Rect(cell_x + f_x, cell_y + f_y, cell_x + f_x + f_w, cell_y + f_y + f_h)
                     key_lower = field_key.lower()
-
+                    
+                    # 1. SPECIAL PADDING FOR ALPHA FIELDS (Better for misalignment)
+                    if any(k in key_lower for k in ['name', 'relative']):
+                        field_rect = fitz.Rect(
+                            cell_x + f_x - 10,  # More left padding for long names
+                            cell_y + f_y - 3, 
+                            cell_x + f_x + f_w + 10, # More right padding
+                            cell_y + f_y + f_h + 3
+                        )
+                    elif any(k in key_lower for k in ['age', 'gender']):
+                        field_rect = fitz.Rect(
+                            cell_x + f_x - 5, 
+                            cell_y + f_y - 2, 
+                            cell_x + f_x + f_w + 5, 
+                            cell_y + f_y + f_h + 2
+                        )
+                    else:
+                        field_rect = fitz.Rect(cell_x + f_x, cell_y + f_y, cell_x + f_x + f_w, cell_y + f_y + f_h)
+                    
                     # Try Text Layer First for speed
                     layer_text = ""
-                    try: layer_text = page.get_text("text", clip=field_rect).strip()
+                    use_layer_text = False
+                    try: 
+                        layer_text = page.get_text("text", clip=field_rect).strip()
+                        # If digital text exists and looks like English, use it!
+                        if layer_text and any(c.isalpha() for c in layer_text):
+                             if len(layer_text) > 2: # Trust substantial text
+                                 use_layer_text = True
                     except: pass
                         
-                    use_layer_text = False
-                    if layer_text and len(layer_text) >= 1:
-                        use_layer_text = True
-                        if 'serial' in key_lower and not any(c.isdigit() for c in layer_text):
-                             use_layer_text = False
-                        if any(k in key_lower for k in ['name', 'relative', 'gender', 'booth', 'center', 'address']):
-                             use_layer_text = False # Force OCR for visual fields
-
                     if use_layer_text:
                         clean_val = layer_text
                         raw_text = layer_text
-                        field_res = {'method': 'text_layer'}
+                        field_res = {'method': 'text_layer', 'text': layer_text, 'raw_text': layer_text}
                     else:
                         field_pix = page.get_pixmap(clip=field_rect, dpi=400, alpha=False)
                         crop_img = Image.frombytes("RGB", [field_pix.width, field_pix.height], field_pix.samples)
@@ -782,6 +797,9 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
 
                         field_res = local_ocr_processor.extract_full_cell_text(image=crop_img, force_marathi=False)
                         raw_text = field_res.get('raw_text', '').strip()
+                        clean_val = field_res.get('text', '').strip()
+                        if not clean_val:
+                            clean_val = raw_text
                                   # === FIELD CLEANING ===
                     if 'name' in key_lower:
                         is_rel = 'relative' in key_lower
@@ -798,7 +816,17 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                             additional_fields['nameKannada'] = TranslitHelper.translate_to_kannada(clean_val)
 
                     elif 'age' in key_lower:
-                        digits = re.sub(r'[^0-9]', '', clean_val)
+                        # 1. Clean visual misreads for numbers
+                        val = clean_val.strip().upper()
+                        val = val.replace('O', '0').replace('U', '0').replace('I', '1').replace('L', '1').replace('B', '8').replace('S', '5')
+                        
+                        digits = re.sub(r'[^0-9]', '', val)
+                        if not digits:
+                             # Try raw text as fallback
+                             val_raw = raw_text.strip().upper()
+                             val_raw = val_raw.replace('O', '0').replace('U', '0').replace('I', '1').replace('L', '1')
+                             digits = re.sub(r'[^0-9]', '', val_raw)
+                             
                         if not digits:
                             digits = re.sub(r'[^0-9]', '', page.get_text("text", clip=field_rect))
                         

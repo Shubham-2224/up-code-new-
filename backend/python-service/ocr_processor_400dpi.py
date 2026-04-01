@@ -100,7 +100,8 @@ class OCRProcessor400DPI:
         self.paddle_processor = None
         if PADDLE_PROCESSOR_AVAILABLE:
             try:
-                self.paddle_processor = PaddleOCRProcessor(lang='mr')
+                # Default to 'en' for English documents (Better for EPIC)
+                self.paddle_processor = PaddleOCRProcessor(lang='en')
             except Exception as e:
                 print(f"Failed to init PaddleOCR: {e}")
 
@@ -602,6 +603,24 @@ class OCRProcessor400DPI:
                         'processing_steps': best_result.get('processing_steps', []) + ["Used character-level processing"]
                     }
 
+            # FALLBACK: Try PaddleOCR if Tesseract is not confident
+            if self.paddle_processor and best_result['confidence'] < 0.9 and self.quality_mode != 'fast':
+                try:
+                    self.paddle_processor.set_language('en')
+                    paddle_text = self.paddle_processor.get_full_text(image).strip()
+                    if paddle_text:
+                        match = self._validate_epic_format(paddle_text)
+                        if match and match['confidence'] > best_result['confidence']:
+                            best_result = {
+                                'voter_id': match['epic'],
+                                'confidence': match['confidence'],
+                                'method': 'paddle_epic_fallback',
+                                'raw_text': paddle_text,
+                                'processing_steps': best_result.get('processing_steps', []) + [f"Found {match['epic']} with PaddleOCR Fallback"]
+                            }
+                except:
+                    pass
+
             # Final cleanup and format enforcement
             if best_result['voter_id']:
                 # Ensure proper format correction
@@ -1094,13 +1113,16 @@ class OCRProcessor400DPI:
             text = ""
             method = "none"
 
-            # STRATEGY 1: PaddleOCR (English Mode)
+            # STRATEGY 1: PaddleOCR (English/Marathi Mode)
             if self.paddle_processor and self.quality_mode != 'fast':
                 try:
-                    # Target English primarily
+                    # Target Language intelligently
+                    target_lang = 'mr' if force_marathi else 'en'
+                    self.paddle_processor.set_language(target_lang)
+                    
                     text = self.paddle_processor.get_full_text(image, separator="\n")
                     if text.strip():
-                        method = 'paddle_eng'
+                        method = f'paddle_{target_lang}'
                 except Exception as e:
                     pass
 
@@ -1129,7 +1151,7 @@ class OCRProcessor400DPI:
             }
 
         except Exception as e:
-            # print(f"      ERROR in extract_full_cell_text: {e}")
+            print(f"      ERROR in extract_full_cell_text: {e}")
             return {'text': '', 'method': 'error', 'error': str(e)}
 
     def _post_process_text(self, text: str) -> str:

@@ -17,14 +17,21 @@ class TranslitHelper:
     def correct_ocr_misreads(text):
         """
         Fix common English OCR misreads for voter documents.
+        This should be used carefully to avoid mangling names.
         """
         if not text: return ""
-        # Fix common digit-letter confusions
-        text = text.replace('O', '0').replace('I', '1').replace('L', '1')
-        # Fix gender misreads
-        text = re.sub(r'\bNale\b', 'Male', text, flags=re.IGNORECASE)
-        text = re.sub(r'\bPiale\b', 'Male', text, flags=re.IGNORECASE)
-        text = re.sub(r'\bRenale\b', 'Female', text, flags=re.IGNORECASE)
+        
+        # 1. Fix common gender misreads (more robust)
+        # Only if the text looks like it might be a gender field
+        t_upper = text.strip().upper()
+        if t_upper in ['NALE', 'PIALE', 'PU', 'PUR', 'MALE']:
+             return "Male"
+        if t_upper in ['RENALE', 'STRI', 'MAHILA', 'FEM', 'FE', 'FEMALE']:
+             return "Female"
+
+        # 2. Fix common "Name" label misreads (pre-cleaning)
+        text = re.sub(r'\b(Nam|Nav|Nam|Nav|Nam)\b', 'Name', text, flags=re.IGNORECASE)
+        
         return text
 
     @staticmethod
@@ -70,17 +77,25 @@ class TranslitHelper:
             return ""
         t = str(text).strip().upper()
         
-        # English Priority
-        if 'MALE' in t or t == 'M' or t == 'M.' or t.startswith('M ') or t.endswith(' M'):
-             return "Male"
-        if 'FEMALE' in t or t == 'F' or t == 'F.' or t.startswith('F ') or t.endswith(' F'):
+        # 1. Direct priority matches
+        if any(k in t for k in ['FEMALE', 'STRI', 'RENALE', 'FE ']):
              return "Female"
+        if any(k in t for k in ['MALE', 'PURUSH', 'NALE', 'PIALE']):
+             return "Male"
              
-        # Fallback for common misreads
-        if any(k in t for k in ['NALE', 'PIALE', 'PU', 'PUR']):
-             return "Male"
-        if any(k in t for k in ['RENALE', 'STRI', 'MAHILA', 'FEM', 'FE']):
-             return "Female"
+        # 2. Strict character matches
+        if t in ['M', 'M.', 'MALE']: return "Male"
+        if t in ['F', 'F.', 'FEMALE']: return "Female"
+
+        # 3. Fuzzy matches for common OCR misreads
+        if t.startswith('M') or t.endswith('M') or 'MAL' in t: return "Male"
+        if t.startswith('F') or t.endswith('F') or 'FEM' in t: return "Female"
+        
+        # 4. Handle very messy OCR (e.g. 'hl', 'H1', 'i1', 'li')
+        # If it starts with h, l, i, etc it might be M/F? No, let's keep it safe.
+        # But commonly 'M' is read as 'H' or 'N'.
+        if any(k in t for k in ['PU', 'PUR', 'NAT', 'NAL']): return "Male"
+        if any(k in t for k in ['MAH', 'STRI', 'W ']): return "Female"
         
         return ""
 
@@ -111,9 +126,17 @@ class TranslitHelper:
         # 1. Basic OCR cleanup
         text = text.replace('||', '').replace('|', '').replace(':', '')
         
-        # 2. Remove common English labels
-        labels_pattern = r'^(?:Father|Husband|Mother|Relative|Other|Name|Nam|Nav|Nam)\'?\s*s?\s*(?:Name|Nav|Nam)?\s*(?:is)?\s*[:\-\.\|\\/ ]*'
+        # 2. Remove common English labels and OCR artifacts (like Photo indicators)
+        labels_pattern = r'^(?:Father|Husband|Mother|Relative|Other|Name|Nam|Nav|Nam|Phoate|Photo|Pnote|Pinoie|Fnote|Cnoto|Polo|Pnale|Not|Nat)\'?\s*s?\s*(?:Name|Nav|Nam|Not|Available)?\s*(?:is)?\s*[:\-\.\|\\/ ]*'
         text = re.sub(labels_pattern, '', text, flags=re.IGNORECASE).strip()
+        
+        # 2.1 Specific junk removals for common bleeding text
+        junk_patterns = [
+            r'\b(?:Phoate|Phote|Pnote|Pinoie|Fnote|Cnoto|Polo|Pnale)\s*(?:Nat|Not)?\b',
+            r'\bPhoto\s*(?:Available|Not)?\b'
+        ]
+        for jp in junk_patterns:
+             text = re.sub(jp, '', text, flags=re.IGNORECASE).strip()
         
         # 3. Strictly keep only English letters and spaces
         text = re.sub(r'[^a-zA-Z\s]', ' ', text)
