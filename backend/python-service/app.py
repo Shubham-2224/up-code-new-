@@ -992,8 +992,12 @@ def test_ocr():
         image_bytes = image_file.read()
         image = Image.open(io.BytesIO(image_bytes))
         
+        # WATERMARK REMOVAL: Push grey pixels > 160 to pure white (removes background watermarks)
+        image_gray = image.convert('L')
+        image_clean = image_gray.point(lambda p: 255 if p > 160 else p)
+        
         # Test OCR
-        text = pytesseract.image_to_string(image, lang='eng+hin')
+        text = pytesseract.image_to_string(image_clean, lang='eng+hin')
         
         return jsonify({
             'success': True,

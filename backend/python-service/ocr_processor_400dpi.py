@@ -39,14 +39,14 @@ class OCRProcessor400DPI:
 
     def __init__(self):
         """Initialize OCR processor"""
-        # PERFORMANCE OPTIMIZATION: Use configurable DPI with default for speed
-        self.dpi = int(os.getenv('OCR_DPI', '150'))  # Default to 150 DPI for faster processing
+        # PERFORMANCE OPTIMIZATION: Use high DPI by default for maximum accuracy (User Request)
+        self.dpi = 300 # Standard high-quality DPI
         self.current_lang = 'mr' # Default to Marathi
-        self.quality_mode = os.getenv('OCR_QUALITY', 'fast')  # fast, balanced, accurate
+        self.quality_mode = 'accurate' # Default to accurate for 'perfect' data
 
         # Performance optimization: Cache for processed images
         self.image_cache = {}
-        self.cache_max_size = 50  # Limit cache size to prevent memory issues
+        self.cache_max_size = 100 # Increased cache for repetitive fields
 
         # Configure Tesseract path from environment (critical for systemd services)
         tesseract_cmd = os.getenv('TESSERACT_CMD')
@@ -66,47 +66,35 @@ class OCRProcessor400DPI:
             r'\b[A-Z]{2,4}[0-9]{6,8}\b',       # Flexible: 2-4 letters + 6-8 digits
         ]
 
-        # Performance settings based on quality mode
-        if self.quality_mode == 'fast':
-            self.max_retries = 1  # Minimal retries for speed
-            self.min_confidence_threshold = 0.6
-            self.enable_char_processing = False # Disable individual char OCR
-            self.enable_paddle_fallback = False # Use Tesseract primarily if fast
-        elif self.quality_mode == 'balanced':
-            self.max_retries = 2  # Moderate retries
-            self.min_confidence_threshold = 0.4
-            self.enable_char_processing = False # Still disable for balanced
-            self.enable_paddle_fallback = True  # Enable for better Marathi
-        else:  # accurate
-            self.max_retries = 3  # Maximum retries for accuracy
-            self.min_confidence_threshold = 0.3
-            self.enable_char_processing = True  # Only for accurate
-            self.enable_paddle_fallback = True
+        # Performance settings based on quality mode - PREFER ACCURACY
+        self.max_retries = 3
+        self.min_confidence_threshold = 0.3
+        self.enable_char_processing = True
+        self.enable_paddle_fallback = True
 
     def set_quality_mode(self, mode: str):
         """Update quality mode and related flags"""
         self.quality_mode = mode
         if mode == 'fast':
-            self.max_retries = 1
-            self.min_confidence_threshold = 0.6
+            self.max_retries = 2 # At least 2 for basic accuracy
+            self.min_confidence_threshold = 0.5
             self.enable_char_processing = False
             self.enable_paddle_fallback = False
-            self.dpi = 200 # Faster DPI for fast mode
+            self.dpi = 300 # Keep 300 DPI even in fast mode for ID accuracy
         elif mode == 'balanced':
-            self.max_retries = 2
-            self.min_confidence_threshold = 0.4
-            self.enable_char_processing = False
-            self.enable_paddle_fallback = True
-            self.dpi = 300
-        else:
             self.max_retries = 3
-            self.min_confidence_threshold = 0.3
+            self.min_confidence_threshold = 0.4
             self.enable_char_processing = True
             self.enable_paddle_fallback = True
             self.dpi = 300
+        else: # accurate
+            self.max_retries = 5 # Maximum retries for 'perfect' data
+            self.min_confidence_threshold = 0.2
+            self.enable_char_processing = True
+            self.enable_paddle_fallback = True
+            self.dpi = 400 # 400 DPI for maximum precision
 
-
-        print("OK: OCR Processor initialized with 300 DPI (EPIC-optimized)")
+        print(f"OK: OCR Processor set to {mode} mode ({self.dpi} DPI)")
 
         # Initialize PaddleOCR if available
         self.paddle_processor = None
@@ -252,33 +240,39 @@ class OCRProcessor400DPI:
                 # 2. Convert to Grayscale
                 image = image.convert('L')
                 
-                # 3. Denoise (Skip if fast mode)
+                # WATERMARK SUPPRESSION: Force light-gray pixels (140-255) to pure white.
+                # Highly effective against "STATE ELECTION COMMISSION" watermarks.
+                image = image.point(lambda p: 255 if p > 140 else p)
+                
+                # 4. Denoise
                 if not skip_heavy_ops:
                     image = image.filter(ImageFilter.MedianFilter(size=3))
                 
-                # 4. Light Sharpen (reduced from 2.0 to 1.5 for better character recognition)
+                # 5. Contrast & Sharpening
                 enhancer = ImageEnhance.Sharpness(image)
                 image = enhancer.enhance(1.5)
-
-                # 5. Contrast / Binarization
-                # Moderate Contrast (reduced from 2.0 to 1.5 to avoid character distortion)
                 enhancer = ImageEnhance.Contrast(image)
-                image = enhancer.enhance(1.5)
+                image = enhancer.enhance(2.0) 
                 
-                # Adaptive Thresholding (Binarization) using OpenCV if available
+                # 6. STRICT ADAPTIVE THRESHOLDING (Binarization)
                 if CV2_AVAILABLE:
                      img_np = np.array(image)
-                     # Adaptive Threshold: Block Size 11, C=2
+                     # Adaptive Threshold: Block Size 11, C=20 (Ultra-clean cleanup for watermarks)
+                     # Increasing C from 15 to 20 forces more gray pixels to pure white background
                      binary = cv2.adaptiveThreshold(
                          img_np, 255, 
                          cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                          cv2.THRESH_BINARY, 
-                         11, 2
+                         11, 20
                      )
+                     
+                     # 7. Morphological Cleanup: Remove isolated small noise specs
+                     kernel = np.ones((1, 1), np.uint8)
+                     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+                     
                      image = Image.fromarray(binary)
                 else:
-                     # Fallback PIL Binarization (single threshold)
-                     image = image.point(lambda x: 0 if x < 128 else 255, '1')
+                     image = image.point(lambda x: 0 if x < 120 else 255, '1')
                      
             except Exception as e:
                 print(f"      Pre-processing warning: {e}")
@@ -1100,38 +1094,33 @@ class OCRProcessor400DPI:
             text = ""
             method = "none"
 
-            # STRATEGY 1: PaddleOCR (Best for Marathi)
-            # Skip PaddleOCR in 'fast' mode for maximum speed
+            # STRATEGY 1: PaddleOCR (English Mode)
             if self.paddle_processor and self.quality_mode != 'fast':
                 try:
-                    # If forcing Marathi, ensure we use Marathi model logic primarily
-                    # Reduced logging for speed
+                    # Target English primarily
                     text = self.paddle_processor.get_full_text(image, separator="\n")
                     if text.strip():
-                        method = 'paddle_mar'
+                        method = 'paddle_eng'
                 except Exception as e:
                     pass
 
-            # STRATEGY 2: Tesseract Fallback (Primary in 'fast' mode)
+            # STRATEGY 2: Tesseract Fallback (English Mode)
             if not text.strip():
                 try:
-                    # If enforcing Marathi, ONLY use Marathi language data to avoid English confusion
-                    langs = 'mar' if force_marathi else 'mar+hin+eng'
-                    
-                    # Performance optimization: cache result of get_languages
-                    # For simplicity, we assume 'mar' is available or fallback is handled by pytesseract
+                    # FORCE ENGLISH MODE as requested by user
+                    langs = 'eng'
                     
                     text = pytesseract.image_to_string(
                         processed_img,
                         lang=langs,
-                        config='--psm 6 --oem 1' # OEM 1 is usually faster Neural net mode
+                        config='--psm 6 --oem 1'
                     ).strip()
                     method = 'tesseract_fallback'
                 except Exception as e:
                     pass
             
             # Post-Processing / Reconstruction
-            final_text = self._post_process_marathi_text(text, remove_english=force_marathi)
+            final_text = self._post_process_text(text)
 
             return {
                 'text': final_text,
@@ -1143,33 +1132,26 @@ class OCRProcessor400DPI:
             # print(f"      ERROR in extract_full_cell_text: {e}")
             return {'text': '', 'method': 'error', 'error': str(e)}
 
-    def _post_process_marathi_text(self, text: str, remove_english: bool = False) -> str:
+    def _post_process_text(self, text: str) -> str:
         """
-        Clean and reconstruct Marathi text from OCR output.
+        Clean and reconstruct English text from OCR output.
         - Fix broken lines
         - Remove OCR garbage
         - Normalize unicode
         - ALWAYS remove pipes (|), double pipes (||), and colons (:)
-        - OPTIONALLY remove English characters
         """
         if not text: 
             return ""
 
         # 1. Global Cleanup: Remove pipes and colons
-        # Replace | and || and : with empty string
         text = text.replace('||', '').replace('|', '').replace(':', '')
         
-        # 1.1 Targeted OCR Corrections (e.g., ठोळके -> शेळके)
+        # 1.1 Targeted OCR Corrections
         try:
             from translit_helper import TranslitHelper
-            text = TranslitHelper.correct_marathi_ocr(text)
-        except ImportError:
+            text = TranslitHelper.correct_ocr_misreads(text)
+        except:
             pass
-
-        # 2. Variable Cleanup: Remove English if requested
-        if remove_english:
-            # Regex to remove all English letters (A-Z, a-z)
-            text = re.sub(r'[A-Za-z]', '', text)
 
         lines = text.split('\n')
         cleaned_lines = []

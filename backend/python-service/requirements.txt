@@ -10,3 +10,4 @@ indic-transliteration
 openpyxl
 paddlepaddle
 paddleocr
+deep-translator

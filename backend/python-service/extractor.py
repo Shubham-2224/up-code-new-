@@ -138,6 +138,13 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
         # Skip only if cell is completely in header zone OR completely in footer zone
         if cell_bottom <= extraction_y_start or cell_y >= extraction_y_end:
             return None
+            
+        # Define full cell rect (REQUIRED for extraction logic)
+        cell_full_rect = fitz.Rect(
+            cell_x, cell_y, 
+            cell_x + cell_width_actual, 
+            cell_y + cell_height_actual
+        )
         
         # Get configuration
         cell_template = config.get('cellTemplate', {})
@@ -153,10 +160,12 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
         local_photo_processor = processors.get('photo') if extract_photos else None
         local_smart_detector = processors.get('smart')
         
-        # === EXTRACT VOTER ID WITH MULTI-STRATEGY APPROACH ===
+        # Initialize variables to avoid NameErrors in skip logic
         voter_id_text = ""
         voter_id_confidence = 0.0
         voter_id_method = "none"
+        photo_base64 = ""
+        voter_id_base64 = ""
         cell_stats = {}
         
         # STRATEGY 0: Try PDF Text Layer First (FASTEST & MOST ACCURATE!)
@@ -167,11 +176,15 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                 scaled_voter_id_width = voter_id_box.get('width', 200) * scale_x
                 scaled_voter_id_height = voter_id_box.get('height', 30) * scale_y
                 
+                # Add PADDING to the voter ID box to ensure no part is cut off (especially on misaligned scans)
+                padding_x = 5
+                padding_y = 2
+                
                 voter_id_rect = fitz.Rect(
-                    cell_x + scaled_voter_id_x,
-                    cell_y + scaled_voter_id_y,
-                    cell_x + scaled_voter_id_x + scaled_voter_id_width,
-                    cell_y + scaled_voter_id_y + scaled_voter_id_height
+                    cell_x + scaled_voter_id_x - padding_x,
+                    cell_y + scaled_voter_id_y - padding_y,
+                    cell_x + scaled_voter_id_x + scaled_voter_id_width + padding_x,
+                    cell_y + scaled_voter_id_y + scaled_voter_id_height + padding_y
                 )
                 
                 # Extract text from PDF text layer
@@ -188,18 +201,19 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                     text_layer_clean = re.sub(r'[^A-Z0-9\s]', '', text_layer_clean)  # Remove special chars
                     text_layer_clean = ' '.join(text_layer_clean.split())  # Normalize whitespace
                     
-                    # Try to find voter ID pattern in text layer
+                    # Try to find voter ID pattern in text layer (Strictly 3-7)
                     voter_id_patterns = [
-                        r'\b([A-Z]{3}[0-9]{7})\b',           # Standard: ABC1234567
+                        r'\b([A-Z]{3}[0-9]{7})\b',           # Best: ABC1234567
                         r'\b([A-Z]{3}\s*[0-9]{7})\b',        # With space: ABC 1234567
-                        r'\b([A-Z]{2,4}[0-9]{6,8})\b',       # Flexible
+                        r'\b([A-Z]{2,4}[0-9]{6,8})\b',       # Catch flexible but clean up later
                     ]
                     
                     text_layer_voter_id = ""
                     for pattern in voter_id_patterns:
                         matches = re.findall(pattern, text_layer_clean)
                         if matches:
-                            text_layer_voter_id = matches[0].replace(' ', '')
+                            # If it's a list (some matches are strings), take the longest
+                            text_layer_voter_id = max(matches, key=len).replace(' ', '')
                             break
                     
                     # If found valid voter ID in text layer, use it!
@@ -232,26 +246,16 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                 scaled_voter_id_width = voter_id_box.get('width', 200) * scale_x
                 scaled_voter_id_height = voter_id_box.get('height', 30) * scale_y
                 
-                voter_id_rect = fitz.Rect(
-                    cell_x + scaled_voter_id_x,
-                    cell_y + scaled_voter_id_y,
-                    cell_x + scaled_voter_id_x + scaled_voter_id_width,
-                    cell_y + scaled_voter_id_y + scaled_voter_id_height
-                )
+                # Add PADDING to ensure we don't cut off the first or last character
+                padding_x = 5
+                padding_y = 2
                 
-                if VERBOSE_OCR_LOGS:
-                    print(f"      📄 Strategy 1: Enhanced EPIC Processing (500 DPI internal)...")
-
-                # Use Master Page Scaling for precision
-                voter_id_crop = None
-                if master_page_img and master_page_scale:
-                    left = max(0, int(voter_id_rect.x0 * master_page_scale) - 2)
-                    top = max(0, int(voter_id_rect.y0 * master_page_scale) - 2)
-                    right = min(master_page_img.width, int(voter_id_rect.x1 * master_page_scale) + 2)
-                    bottom = min(master_page_img.height, int(voter_id_rect.y1 * master_page_scale) + 2)
-                    voter_id_crop = master_page_img.crop((left, top, right, bottom))
+                # ALWAYS use high-DPI rendering for Voter ID (Ground Truth)
+                voter_id_pix = page.get_pixmap(clip=voter_id_rect, dpi=500, alpha=False)
+                voter_id_crop = Image.frombytes("RGB", [voter_id_pix.width, voter_id_pix.height], voter_id_pix.samples)
 
                 # Use the ADVANCED method directly for Voter ID
+                # EPIC is always English/Numbers
                 result = local_ocr_processor.extract_epic_with_advanced_image_processing(
                     image=voter_id_crop,
                     pdf_page=None if voter_id_crop else page,
@@ -320,9 +324,14 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                 # FAST BUFFER CONVERSION
                 voter_id_img = Image.frombytes("RGB", [voter_id_pix.width, voter_id_pix.height], voter_id_pix.samples)
                 
+                # WATERMARK SUPPRESSION: Force light-gray pixels (150-255) to pure white.
+                # Highly effective against "STATE ELECTION COMMISSION" watermarks.
+                voter_id_img_gray = voter_id_img.convert('L')
+                voter_id_img_clean = voter_id_img_gray.point(lambda p: 255 if p > 150 else p)
+                
                 raw_text = pytesseract.image_to_string(
-                    voter_id_img,
-                    lang='eng+hin',
+                    voter_id_img_clean,
+                    lang='eng',
                     config='--psm 6'
                 ).strip()
                 
@@ -357,6 +366,30 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
             except:
                 pass
         
+        # Strategy 4: Global Pattern Search Fallback
+        if not voter_id_text or len(voter_id_text) < 5:
+            try:
+                # Search the entire cell's digital text layer for ANY EPIC-like pattern
+                full_cell_text = page.get_text("text", clip=cell_full_rect).upper()
+                # Also try searching in the ocr full text if available
+                # (Assuming full_text might be populated later, but we can do a quick OCR here too)
+                
+                epic_patterns = [
+                    r'[A-Z]{3}[0-9]{7}',
+                    r'[A-Z]{3}\s*[0-9]{7}',
+                    r'[A-Z]{2,4}[0-9]{6,8}'
+                ]
+                
+                for pattern in epic_patterns:
+                    matches = re.findall(pattern, full_cell_text)
+                    if matches:
+                        voter_id_text = matches[0].replace(' ', '')
+                        voter_id_confidence = 0.6
+                        voter_id_method = 'global_pattern_fallback'
+                        break
+            except:
+                pass
+        
         # === EXTRACT PHOTO (Only if enabled) ===
         photo_base64 = ""
         photo_quality = 0.0
@@ -378,14 +411,9 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                         cell_y + scaled_photo_y + scaled_photo_height
                     )
                     
-                    # OPTIMIZATION: Crop from master image for perfect alignment
-                    photo_crop = None
-                    if master_page_img:
-                        left = photo_rect.x0 * master_page_scale
-                        top = photo_rect.y0 * master_page_scale
-                        right = photo_rect.x1 * master_page_scale
-                        bottom = photo_rect.y1 * master_page_scale
-                        photo_crop = master_page_img.crop((left, top, right, bottom))
+                    # ALWAYS use high-DPI rendering for photos
+                    photo_pix_high = page.get_pixmap(clip=photo_rect, dpi=400, alpha=False)
+                    photo_crop = Image.frombytes("RGB", [photo_pix_high.width, photo_pix_high.height], photo_pix_high.samples)
 
                     result = local_ocr_processor.extract_photo(
                         image=photo_crop,
@@ -486,15 +514,10 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                 cell_y + cell_height_actual
             )
             
-            # OPTIMIZATION: Skip deep verification if we already have a 100% match from text layer
-            if voter_id_confidence >= 0.99:
-                 if VERBOSE_OCR_LOGS:
-                     print(f"      ✨ Skipping Deep Verify (Already have perfect match via {voter_id_method})")
-                 cell_words = []
-            else:
-                # Extract ALL words with coordinates: (x0, y0, x1, y1, "word", block, line, word)
-                # This uses more CPU but gives perfect spatial awareness
-                cell_words = page.get_text("words", clip=cell_rect_verify)
+            # ALWAYS perform deep verification for maximum integrity
+            # Extract ALL words with coordinates: (x0, y0, x1, y1, "word", block, line, word)
+            # This uses more CPU but gives perfect spatial awareness and resolves 5/6 confusions
+            cell_words = page.get_text("words", clip=cell_rect_verify)
             
             # Compile candidates with their metadata
             candidates = []
@@ -585,28 +608,42 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
         except Exception as e:
             print(f"      ⚠️  Deep Verification Error: {str(e)}")
 
-        # Clean voter ID
+        # Clean voter ID (STRICT ABC1234567 REQUIREMENT)
         if voter_id_text:
-            # Normalize: Uppercase and remove punctuation/spaces
+            # Normalize: Uppercase and remove ALL punctuations/spaces
             voter_id_text = re.sub(r'[^A-Z0-9]', '', voter_id_text.upper())
             
-            # STRICT REQUIREMENT: ABC1234567 (10 chars: 3 Alpha + 7 Numeric)
-            if len(voter_id_text) > 10:
-                voter_id_text = voter_id_text[:10]
+            # User Requirement: Strictly ABC1234567 (10 chars, 3 alpha + 7 digits)
+            if len(voter_id_text) >= 9:
+                # Truncate or pad if slightly off
+                if len(voter_id_text) > 10:
+                     voter_id_text = voter_id_text[:10]
+                
+                # If we have 10 chars, strictly enforce the 3-7 pattern
+                if len(voter_id_text) == 10:
+                    prefix = voter_id_text[:3]
+                    suffix = voter_id_text[3:]
+                    
+                    # Force prefix to be alphabetic
+                    prefix = prefix.replace('0', 'O').replace('1', 'I').replace('2', 'Z').replace('5', 'S').replace('8', 'B')
+                    # Remove any remaining digits in prefix if possible
+                    prefix = re.sub(r'[0-9]', 'O', prefix) 
+                    
+                    # Force suffix to be numeric
+                    suffix = suffix.replace('O', '0').replace('I', '1').replace('L', '1').replace('S', '5').replace('G', '6').replace('B', '8').replace('Z', '2').replace('Q', '0')
+                    # Remove any remaining letters in suffix if possible
+                    suffix = re.sub(r'[A-Z]', '0', suffix)
+                    
+                    voter_id_text = prefix + suffix
             
-            # Apply format-specific fixes if we have exactly 10 characters
-            if len(voter_id_text) == 10:
-                # Ensure positions 1-3 are Alpha
-                prefix = voter_id_text[:3]
-                suffix = voter_id_text[3:]
-                
-                # Fix common OCR digit-to-letter errors in prefix
-                prefix = prefix.replace('0', 'O').replace('1', 'I').replace('2', 'Z').replace('5', 'S').replace('8', 'B')
-                
-                # Fix common OCR letter-to-digit errors in suffix
-                suffix = suffix.replace('O', '0').replace('I', '1').replace('L', '1').replace('S', '5').replace('G', '6').replace('B', '8').replace('Z', '2')
-                
-                voter_id_text = prefix + suffix
+            # Additional fallback for extremely long merged strings
+            elif len(voter_id_text) > 15:
+                # Find best EPIC match within the blob
+                epic_matches = re.findall(r'[A-Z]{3}[0-9]{7}', voter_id_text)
+                if epic_matches:
+                    voter_id_text = epic_matches[0]
+                else:
+                    voter_id_text = voter_id_text[:10]
         
         # DEBUG: Log raw voter ID for troubleshooting
         print(f"      🔍 DEBUG Page {page_num+1}, Row {row+1}, Col {col+1}:")
@@ -615,65 +652,33 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
         print(f"         Voter ID Confidence: {voter_id_confidence:.2f}")
         print(f"         Has Photo: {bool(photo_base64 and len(photo_base64) > 0)}")
         
-        # Skip logic - EXTRACT EVERYTHING WITH DATA!
-        # RULE: Never skip if we have ANY data (voter ID OR photo)
+        # Skip logic - NEVER SKIP DATA (User Request)
+        # Ensure ALL data is extracted, even if Voter ID is missing.
         should_skip = False
         skip_reason = ""
         
-        # Check what data we have - LESS STRICT VALIDATION
-        # Accept ANY voter ID that has content and isn't explicitly marked as invalid
-        invalid_voter_ids = ["NO ID", "NOID", "N/A", "NA", "NOT FOUND", "NONE", "NULL", ""]
-        
-        # Check if voter ID is valid (has content and not in invalid list)
-        has_valid_voter_id = False
-        if voter_id_text:
-            voter_id_upper = voter_id_text.upper().strip()
-            # Accept if it's not in the invalid list and has at least 3 characters
-            if voter_id_upper not in invalid_voter_ids and len(voter_id_text.strip()) >= 3:
-                has_valid_voter_id = True
-                print(f"         ✓ Voter ID is VALID: '{voter_id_text}'")
-            else:
-                print(f"         ✗ Voter ID is INVALID: '{voter_id_text}' (reason: {'too short' if len(voter_id_text.strip()) < 3 else 'in invalid list'})")
-        else:
-            print(f"         ✗ Voter ID is EMPTY")
-        
+        # Check for photo (Still useful for logging)
         has_photo = photo_base64 and len(photo_base64) > 0
         
-        # CRITICAL: If we have a photo, NEVER skip (even without voter ID)
-        if has_photo:
-            should_skip = False  # Always extract if photo exists
-            print(f"         → Decision: EXTRACT (has photo)")
-        # If we have voter ID but no photo, still extract
-        elif has_valid_voter_id:
-            should_skip = False  # Always extract if voter ID exists
-            print(f"         → Decision: EXTRACT (has valid voter ID)")
-        # Only skip if we have NOTHING
+        # Determine if we have a valid voter ID
+        has_valid_voter_id = False
+        if voter_id_text and len(voter_id_text.strip()) >= 5:
+             has_valid_voter_id = True
+             print(f"         ✓ Voter ID found: '{voter_id_text}'")
         else:
-            should_skip = True
-            skip_reason = f"No valid voter ID (got: '{voter_id_text}')"
-            print(f"         → Decision: SKIP ({skip_reason})")
+             print(f"         ✗ No valid voter ID found")
+             # Keep whatever text we have (even if truncated)
+             if not voter_id_text:
+                 voter_id_text = ""
         
-        # USER REQUEST 2026-01-27: REMOVE STRICT FILTERING
-        # User wants ALL data extracted, even without voter ID.
-        # We only skip if there's absolutely no data at all (handled below).
+        # LOGIC: NEVER skip data if it's part of the grid. 
+        # The user wants "No cell is gonna be empty" (Every grid cell should have a row)
+        should_skip = False
         
-        # Check if we have ANY meaningful data
-        has_any_data = has_photo or has_valid_voter_id or (voter_id_text and len(voter_id_text.strip()) > 0)
-        
-        if has_any_data:
-            should_skip = False
-            skip_reason = ""
-        else:
-            should_skip = True
-            skip_reason = "No data found (no photo, no voter ID)"
-
         # Log the final decision
-        if should_skip:
-            print(f"      ⏭️  SKIP Page {page_num+1}, Row {row+1}, Col {col+1}: {skip_reason}")
-        else:
-            voter_id_display = voter_id_text[:20] if voter_id_text else "[No ID]"
-            photo_status = "Yes" if has_photo else "No"
-            print(f"      ✅ EXTRACT Page {page_num+1}, Row {row+1}, Col {col+1}: VoterID='{voter_id_display}', Photo={photo_status}")
+        voter_id_display = voter_id_text[:20] if voter_id_text else "[No ID]"
+        photo_status = "Yes" if has_photo else "No"
+        print(f"      ✅ FORCE EXTRACT Page {page_num+1}, Row {row+1}, Col {col+1}: VoterID='{voter_id_display}', Photo={photo_status}")
         
         if should_skip:
             return {'skipped': True, 'stats': cell_stats}
@@ -682,52 +687,43 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
         # Try to get text from PDF text layer first (for digital PDFs)
         full_text = ""
         text_method = "none"
-        is_marathi = False
         
         try:
-            # Define full cell rect
-            cell_full_rect = fitz.Rect(
-                cell_x, cell_y, 
-                cell_x + cell_width_actual, 
-                cell_y + cell_height_actual
-            )
+            # cell_full_rect already defined at start of card
             
             # 1. Try PDF Text Layer
             text_layer_content = page.get_text("text", clip=cell_full_rect).strip()
             
-            # Check for Devanagari (Marathi) characters (Range: \u0900-\u097F)
-            # We want to see if the text layer actually contains readable Marathi
-            devanagari_chars = len(DEVANAGARI_REGEX.findall(text_layer_content))
+            # Lower thresholds for trusting the text layer (even 1 character might be a serial no)
+            english_chars = len(re.findall(r'[A-Za-z0-9]', text_layer_content))
             
-            if devanagari_chars > 5:
-                # Digital PDF with Marathi support
-                print(f"      📝 Text Layer has Marathi ({devanagari_chars} chars). Using Text Layer.")
+            # Check if text layer has meaningful content
+            if english_chars > 2 or len(text_layer_content) > 5:
+                # Digital PDF found! (More accurate than OCR)
+                print(f"      📝 Text Layer found. Using Text Layer.")
                 full_text = text_layer_content
                 text_method = "pdf_text_layer"
             
             else:
                 # Scanned PDF or broken text layer -> Use OCR
-                print(f"      📄 No digital Marathi text found. Using Intelligent OCR...")
+                print(f"      📄 No digital text found. Using Intelligent OCR...")
                 
                 if local_ocr_processor:
-                    # OPTIMIZATION: Crop from master image
-                    cell_full_crop = None
-                    if master_page_img:
-                        left = cell_full_rect.x0 * master_page_scale
-                        top = cell_full_rect.y0 * master_page_scale
-                        right = cell_full_rect.x1 * master_page_scale
-                        bottom = cell_full_rect.y1 * master_page_scale
-                        cell_full_crop = master_page_img.crop((left, top, right, bottom))
+                    # Render full cell at 400 DPI for high fidelity
+                    cell_full_pix = page.get_pixmap(clip=cell_full_rect, dpi=400, alpha=False)
+                    cell_full_crop = Image.frombytes("RGB", [cell_full_pix.width, cell_full_pix.height], cell_full_pix.samples)
 
-                    ocr_res = local_ocr_processor.extract_full_cell_text(
-                        image=cell_full_crop,
-                        pdf_page=None if cell_full_crop else page,
-                        rect=None if cell_full_crop else cell_full_rect,
-                        fast_preprocess=(performance_mode == 'fast')
+                    # Forced English Mode
+                    res = local_ocr_processor.extract_full_cell_text(
+                        image=cell_full_crop, 
+                        pdf_page=None, 
+                        rect=None,
+                        force_marathi=False
                     )
-                    full_text = ocr_res.get('text', '')
-                    text_method = ocr_res.get('method', 'ocr_error')
-                    print(f"      ✅ OCR Text Encoded: {len(full_text)} chars")
+                    
+                    full_text = res.get('text', '')
+                    text_method = res.get('method', 'ocr_error')
+                    print(f"      ✅ Cell OCR Complete ({text_method})")
         
         except Exception as e:
             print(f"      ⚠️  Text Extraction Error: {str(e)}")
@@ -737,416 +733,143 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
         fields_config = cell_template.get('fields', {})
         
         if local_ocr_processor and fields_config:
-            # === OPTIMIZATION: USE MASTER PAGE IMAGE CROP ===
-            # Instead of rendering every small field or cell (expensive I/O), 
-            # we use the master_page_img rendered once per page.
             try:
-                if master_page_img:
-                    # Crop the cell from the master page image
-                    left = cell_full_rect.x0 * master_page_scale
-                    top = cell_full_rect.y0 * master_page_scale
-                    right = cell_full_rect.x1 * master_page_scale
-                    bottom = cell_full_rect.y1 * master_page_scale
-                    master_cell_img = master_page_img.crop((left, top, right, bottom))
-                    
-                    px_scale_x = master_page_scale
-                    px_scale_y = master_page_scale
-                else:
-                    # Fallback to legacy behavior if master image missing
-                    master_cell_pix = page.get_pixmap(clip=cell_full_rect, dpi=250 if performance_mode == 'fast' else 300, alpha=False)
-                    master_cell_img = Image.frombytes("RGB", [master_cell_pix.width, master_cell_pix.height], master_cell_pix.samples)
-                    px_scale_x = master_cell_pix.width / cell_full_rect.width
-                    px_scale_y = master_cell_pix.height / cell_full_rect.height
+                # Master crop for faster sub-field extraction
+                master_cell_pix = page.get_pixmap(clip=cell_full_rect, dpi=400, alpha=False)
+                master_cell_img = Image.frombytes("RGB", [master_cell_pix.width, master_cell_pix.height], master_cell_pix.samples)
+                px_scale_x = master_cell_pix.width / cell_full_rect.width
+                px_scale_y = master_cell_pix.height / cell_full_rect.height
             except Exception as e:
-                print(f"      Warning: Master cell crop failed: {e}")
                 master_cell_img = None
 
-            print(f"      🔍 Extracting {len(fields_config)} configured fields...")
             for field_key, field_box in fields_config.items():
-                # Skip already extracted fields
-                if field_key in ['voterID', 'photo']:
-                    continue
+                if field_key in ['voterID', 'photo']: continue
                 
                 try:
-                    # Calculate text rect
                     f_x = field_box.get('x', 0) * scale_x
                     f_y = field_box.get('y', 0) * scale_y
                     f_w = field_box.get('width', 0) * scale_x
                     f_h = field_box.get('height', 0) * scale_y
                     
-                    field_rect = fitz.Rect(
-                        cell_x + f_x,
-                        cell_y + f_y, 
-                        cell_x + f_x + f_w, 
-                        cell_y + f_y + f_h
-                    )
-
-                    # Determine OCR strategy based on field type
-                    force_marathi = False
+                    field_rect = fitz.Rect(cell_x + f_x, cell_y + f_y, cell_x + f_x + f_w, cell_y + f_y + f_h)
                     key_lower = field_key.lower()
-                    
-                    # 1. Enforce Marathi for Name, Relative Name, Gender, and Age
-                    if 'name' in key_lower or 'relative' in key_lower or 'gender' in key_lower or 'age' in key_lower or 'relation' in key_lower:
-                        force_marathi = True
-                    
-                    # 2. Enforce English/Mixed for House No
-                    if 'house' in key_lower:
-                        force_marathi = False
-                    
-                    
-                    # === CRITICAL OPTIMIZATION: TRY TEXT LAYER FIRST ===
-                    # If PDF has text layer, this is 100x faster than OCR
+
+                    # Try Text Layer First for speed
                     layer_text = ""
-                    try:
-                        layer_text = page.get_text("text", clip=field_rect).strip()
-                    except:
-                        pass
+                    try: layer_text = page.get_text("text", clip=field_rect).strip()
+                    except: pass
                         
-                    # Decide whether to use layer text or fallback to OCR
-                    # We use layer text if it contains meaningful characters
                     use_layer_text = False
-                    if layer_text:
-                        # Check if it has enough content (at least 2 chars)
-                        if len(layer_text) >= 1: 
-                             use_layer_text = True
-                             
-                        # For specific fields, validate content type
+                    if layer_text and len(layer_text) >= 1:
+                        use_layer_text = True
                         if 'serial' in key_lower and not any(c.isdigit() for c in layer_text):
-                             use_layer_text = False # Serial must have digits
-                        
-                        # EXCEPTION: Name, Relative Name, and Gender using Image Processing (User Request for Accuracy)
-                        if 'name' in key_lower or 'relative' in key_lower or 'relation' in key_lower or 'gender' in key_lower:
                              use_layer_text = False
+                        if any(k in key_lower for k in ['name', 'relative', 'gender', 'booth', 'center', 'address']):
+                             use_layer_text = False # Force OCR for visual fields
 
                     if use_layer_text:
-                        # SUPER FAST PATH: Skip Image Extraction entirely!
-                        print(f"         > FAST PATH (Text Layer): '{layer_text[:20]}...'")
-                        field_res = {
-                            'text': layer_text,
-                            'raw_text': layer_text,
-                            'method': 'text_layer'
-                        }
+                        clean_val = layer_text
+                        raw_text = layer_text
+                        field_res = {'method': 'text_layer'}
                     else:
-                        # SLOW PATH: Image Extraction + OCR
-                        # OPTIMIZATION: Use Master Page Image if available (SUPER FAST)
-                        crop_img = None
-                        if master_page_img and master_page_scale:
-                            try:
-                                # Calculate crop coordinates in master_page_img pixels
-                                offset_x = 1 # Small offset to avoid border lines
-                                offset_y = 1
-                                crop_x = int(field_rect.x0 * master_page_scale) + offset_x
-                                crop_y = int(field_rect.y0 * master_page_scale) + offset_y
-                                crop_w = int(field_rect.width * master_page_scale) - (2 * offset_x)
-                                crop_h = int(field_rect.height * master_page_scale) - (2 * offset_y)
-                                
-                                # Ensure we don't go out of bounds
-                                img_w, img_h = master_page_img.size
-                                crop_x = max(0, min(crop_x, img_w - 1))
-                                crop_y = max(0, min(crop_y, img_h - 1))
-                                crop_w = max(1, min(crop_w, img_w - crop_x))
-                                crop_h = max(1, min(crop_h, img_h - crop_y))
-                                
-                                crop_img = master_page_img.crop((crop_x, crop_y, crop_x + crop_w, crop_y + crop_h))
-                            except Exception as e:
-                                print(f"      Warning: Master page crop failed: {e}")
-                                
-                        # OPTIMIZATION: Use Master Cell Crop as fallback
-                        if not crop_img and master_cell_img:
-                            try:
-                                # Calculate relative coordinates inside the cell
-                                rel_x = field_rect.x0 - cell_full_rect.x0
-                                rel_y = field_rect.y0 - cell_full_rect.y0
-                                rel_w = field_rect.width
-                                rel_h = field_rect.height
-                                
-                                # Convert to Pixels
-                                c_x = int(rel_x * px_scale_x)
-                                c_y = int(rel_y * px_scale_y)
-                                c_w = int(rel_w * px_scale_x)
-                                c_h = int(rel_h * px_scale_y)
-                                
-                                crop_img = master_cell_img.crop((c_x, c_y, c_x + c_w, c_y + c_h))
-                            except Exception as e:
-                                pass
-
-                        # EXTRACT IMAGE FOR THIS FIELD (User Request: "Proper images of selected parts")
-                        if crop_img:
-                            try:
-                                # Store as base64 for the user to see - ALWAYS extract as image if part of template
-                                # (Reduced quality to avoid excessive memory but high enough for readability)
-                                b64_buffer = io.BytesIO()
-                                crop_img.convert('RGB').save(b64_buffer, format='JPEG', quality=85)
-                                field_image_b64 = base64.b64encode(b64_buffer.getvalue()).decode('utf-8')
-                                additional_fields[f"{field_key}_image"] = field_image_b64
-                                # Also store in standard key for compatibility
-                                if 'photo' in key_lower:
-                                    photo_base64 = field_image_b64
-                            except:
-                                pass
-
-                        # Run OCR
-                        field_res = local_ocr_processor.extract_full_cell_text(
-                            image=crop_img,
-                            pdf_page=page if not crop_img else None,
-                            rect=field_rect if not crop_img else None,
-                            force_marathi=force_marathi,
-                            fast_preprocess=(performance_mode == 'fast')
-                        )
-                    
-                    raw_text = field_res.get('raw_text', '').strip()
-                    clean_val = field_res.get('text', '').strip()
-                    
-                    # === SPECIAL HANDLING FOR RELATIVE NAME & RELATION TYPE ===
-                    if 'relative' in key_lower:
-                        # Use strictly map_relation_type for identifying the type from raw_text
-                        check_text = raw_text.replace('\n', ' ')
-                        # Use map_relation_type to map to H, F, M, O
-                        relation_type = TranslitHelper.map_relation_type(check_text)
+                        field_pix = page.get_pixmap(clip=field_rect, dpi=400, alpha=False)
+                        crop_img = Image.frombytes("RGB", [field_pix.width, field_pix.height], field_pix.samples)
                         
-                        # Store in additional_fields
-                        additional_fields['relationType'] = relation_type
+                        # Store image
+                        b64_buffer = io.BytesIO()
+                        crop_img.save(b64_buffer, format='JPEG', quality=85)
+                        additional_fields[f"{field_key}_image"] = base64.b64encode(b64_buffer.getvalue()).decode('utf-8')
+
+                        field_res = local_ocr_processor.extract_full_cell_text(image=crop_img, force_marathi=False)
+                        raw_text = field_res.get('raw_text', '').strip()
+                                  # === FIELD CLEANING ===
+                    if 'name' in key_lower:
+                        is_rel = 'relative' in key_lower
+                        clean_val = TranslitHelper.sanitize_name(clean_val, is_relative=is_rel)
                         
-                        # Cleanup Relative Name: Remove the label part (before first colon)
-                        if ':' in clean_val:
-                            parts = clean_val.split(':', 1)
-                            if len(parts) > 1:
-                                clean_val = parts[1].strip()
-                        
-                        # Fallback: strict cleanup if label text is merging with name
-                        # Remove common prefixes from the name value itself
-                        clean_val = re.sub(r'^(पतीचे|वडिलांचे|इतर|आईचे)\s*(नाव|नावं)?[:\-\s]*', '', clean_val).strip()
-
-                    # === SPECIAL HANDLING FOR NAME & RELATIVE NAME (Remove Numbers & Asterisks) ===
-                    if 'name' in key_lower or 'relative' in key_lower:
-                        # 1. Targeted OCR corrections (e.g., ठोळके -> शेळके)
-                        clean_val = TranslitHelper.correct_marathi_ocr(clean_val)
-                        
-                        # 2. Remove digits (0-9 and Marathi ०-९) and asterisks (*)
-                        clean_val = re.sub(r'[0-9०-९\*]', '', clean_val).strip()
-
-                    # === SPECIAL HANDLING FOR AGE ===
-                    if 'age' in key_lower:
-                        def validate_age_text(val_str):
-                            if not val_str: return None
-                            # Convert Marathi digits to English
-                            marathi_digits = str.maketrans("०१२३४५६७८९", "0123456789")
-                            val_str = val_str.translate(marathi_digits)
-                            # Keep only ASCII digits
-                            val_str = re.sub(r'[^0-9]', '', val_str)
-                            if not val_str: return None
-                            # Sanity check: Age must be <= 100
-                            try:
-                                age_int = int(val_str)
-                                if age_int > 100: return None
-                                # Optional: minimal voter age check (e.g. > 15 to allow errors close to 18)
-                                if age_int < 10: return None 
-                                return val_str
-                            except:
-                                return None
-
-                        # 1. Try PDF Text Layer FIRST (High accuracy)
-                        layer_text = page.get_text("text", clip=field_rect).strip()
-                        valid_age = validate_age_text(layer_text)
-
-                        if valid_age:
-                            clean_val = valid_age
-                            print(f"         > Age found in Text Layer: {clean_val}")
+                        if is_rel:
+                            additional_fields['relativeName'] = clean_val
+                            additional_fields['relativeNameEnglish'] = clean_val
+                            additional_fields['relativeNameKannada'] = TranslitHelper.translate_to_kannada(clean_val)
+                            additional_fields['relationType'] = TranslitHelper.map_relation_type(raw_text)
                         else:
-                            # 2. Fallback to OCR result (already in clean_val)
-                            valid_age_ocr = validate_age_text(clean_val)
-                            if valid_age_ocr:
-                                clean_val = valid_age_ocr
-                            else:
-                                # Both failed or invalid
-                                print(f"         > Age validation failed for OCR text: '{clean_val}' and Layer text: '{layer_text}'")
-                                clean_val = ""
+                            additional_fields['name'] = clean_val
+                            additional_fields['nameEnglish'] = clean_val
+                            additional_fields['nameKannada'] = TranslitHelper.translate_to_kannada(clean_val)
 
-                     # === SPECIAL HANDLING FOR GENDER ===
-                    if 'gender' in key_lower:
-                         # Keep only Marathi/Devanagari characters and remove punctuation
-                         clean_val = re.sub(r'[^\w\s\u0900-\u097F]', '', clean_val).strip()
-
-                         # FIX SPECIFIC OCR ERRORS: Replace incorrect gender extractions with correct values
-                         if any(k in clean_val for k in ['पन', 'पक', '2 पक', '2पक', '2 प', 'प', '2', 'पक्', 'पू', 'पम', 'पर']):
-                             clean_val = "पु"  # Replace with correct Male gender (पु)
-                         elif clean_val in ['स्री', 'स्त्री', 'महिला', 'स्री.', 'स्त्री.']:
-                             clean_val = "स्री"  # Ensure Female gender is properly formatted
-                         else:
-                             # Use TranslitHelper for Gender mapping (handles 'पर' -> 'पु', etc.)
-                             gender_standard = TranslitHelper.map_gender(clean_val)
-                             if gender_standard == "Male": clean_val = "पु"
-                             elif gender_standard == "Female": clean_val = "स्री"
-
-                    # === SPECIAL HANDLING FOR HOUSE NO ===
-                    if 'house' in key_lower:
-                        # Remove colons and common labels from house number
-                        clean_val = re.sub(r'^(?:HOUSE|HS|NO|NUM)[:\- .]*', '', clean_val, flags=re.IGNORECASE)
-                        clean_val = re.sub(r'[:]', '', clean_val).strip()
-                    # === SPECIAL HANDLING FOR SERIAL NO / ASSEMBLY NO ===
-                    if any(k in key_lower for k in ['serial', 'assembly', 'ac', 'pc', 'part']):
-                        # Convert Marathi digits to English
-                        marathi_digits = str.maketrans("०१२३४५६७८९", "0123456789")
-                        clean_val = clean_val.translate(marathi_digits)
+                    elif 'age' in key_lower:
+                        digits = re.sub(r'[^0-9]', '', clean_val)
+                        if not digits:
+                            digits = re.sub(r'[^0-9]', '', page.get_text("text", clip=field_rect))
                         
-                        if any(k in key_lower for k in ['assembly', 'part', 'ac', 'pc']):
-                            # === ASSEMBLY / PART NUMBER CLEANING ===
-                            # Fix OCR Typos first (Aggressive)
-                            clean_val = clean_val.upper()
-                            # 1. Remove Labels (Include fragments like A, P, AC, PC, and common OCR artifacts like leading digits)
-                            # Only strip if it's a clear label, not part of the number
-                            # Handles artifacts like "4 AC", "4Assembly", etc.
-                            clean_val = re.sub(r'^\s*(?:[0-9A-Z]*\s*)?(?:ASSEMBLY|PART|AC|PC|NO|NUM|A|P|ACNO)\b\s*[:.\- ]*', '', clean_val, flags=re.IGNORECASE)
-                            
-                            # 2. Fix OCR substitutions (O->0, I->1, S->5, etc.)
-                            clean_val = clean_val.replace('O', '0').replace('D', '0').replace('Q', '0')
-                            clean_val = clean_val.replace('I', '1').replace('L', '1').replace('|', '1').replace(']', '1').replace('!', '1')
-                            clean_val = clean_val.replace('Z', '2')
-                            clean_val = clean_val.replace('S', '5')
-                            clean_val = clean_val.replace('B', '8')
-                            
-                            # 3. Strip Non-Allowed Chars (Keep Digits, Slash, Hyphen, Comma)
-                            # User mentioned "extract comma and all number" for serial, applying safe approach here too.
-                            clean_val = re.sub(r'[^0-9/,\-]', '', clean_val)
-                            
+                        age_val = digits if (digits and 0 < int(digits) < 125) else ""
+                        additional_fields['age'] = age_val
+
+                    elif 'gender' in key_lower:
+                        g = TranslitHelper.map_gender(clean_val)
+                        if not g: g = TranslitHelper.map_gender(raw_text)
+                        additional_fields['gender'] = g
+                        additional_fields['genderEnglish'] = g
+                        additional_fields['genderKannada'] = TranslitHelper.translate_to_kannada(g)
+
+                    elif any(k in key_lower for k in ['booth', 'center', 'address', 'station']):
+                        clean_val = TranslitHelper.clean_booth_info(clean_val)
+                        if 'address' in key_lower:
+                            additional_fields['boothAddress'] = clean_val
+                            additional_fields['boothAddressEnglish'] = clean_val
+                            additional_fields['boothAddressKannada'] = TranslitHelper.translate_to_kannada(clean_val)
                         else:
-                            # === SERIAL NUMBER CLEANING ===
-                            
-                            # CHECK METHOD: If Text Layer, we trust the digits more and avoid aggressive S->5
-                            if field_res.get('method') == 'text_layer':
-                                # Simple Cleanup for Digital Text
-                                # Keep digits AND COMMAS (as per user request: "1,005" should be kept as "1,005")
-                                clean_val = re.sub(r'[^0-9,]', '', clean_val)
-                                # No S->5 replacement needed for digital text
-                            else:
-                                # OCR Path - Aggressive Cleaning
-                                # 1. Fix common alpha-digit OCR confusions UPPERCASE
-                                clean_val = clean_val.upper()
-                                
-                                # STEP A: Remove common LABELS (Be cautious with single letter 'S' to avoid stripping digit '2')
-                                clean_val = re.sub(r'^\s*(?:SR|SL|NO|NUM|SERIAL|SER)\b\s*[:.\- ]*', '', clean_val, flags=re.IGNORECASE)
-                                # Only strip single 'S' if followed by space or separator
-                                clean_val = re.sub(r'^\s*S\s+[:.\- ]*', '', clean_val, flags=re.IGNORECASE)
-                                clean_val = clean_val.strip()
-    
-                                # Aggressive replacements for Serial Number field (strictly numeric)
-                                clean_val = clean_val.replace('O', '0').replace('D', '0').replace('Q', '0')
-                                clean_val = clean_val.replace('I', '1').replace('L', '1').replace('|', '1').replace(']', '1').replace('!', '1').replace('J', '1').replace('T', '1')
-                                clean_val = clean_val.replace('Z', '2')
-                                clean_val = clean_val.replace('E', '3') # Common confusion
-                                clean_val = clean_val.replace('A', '4')
-                                
-                                # Only replace S->5 if NOT at start? No, we stripped labels.
-                                # But what if "S" is left? e.g. "S 56" -> "S 56" -> "5 56".
-                                # Safe to replace now.
-                                clean_val = clean_val.replace('S', '5') 
-                                clean_val = clean_val.replace('G', '6')
-                                clean_val = clean_val.replace('B', '8')
-                            
-                            # 2. Extract VALID number sequence (Removed strict length limits as per user request "no limitation")
-                            # Find all sequences of digits (AND COMMAS) to preserve "1,005"
-                            numbers = NUMBER_CLEANUP_REGEX.findall(clean_val)
-                            
-                            valid_serial = ""
-                            if numbers:
-                                # Prioritize the one that is mostly digits
-                                for num in numbers:
-                                    # Must contain at least one digit
-                                    if any(c.isdigit() for c in num):
-                                        valid_serial = num
-                                        break
-                                
-                                if not valid_serial and numbers:
-                                     valid_serial = numbers[0]
-                                         
-                            clean_val = valid_serial
-                        
-                        # Store cleaned value
+                            additional_fields['boothCenter'] = clean_val
+                            additional_fields['boothCenterEnglish'] = clean_val
+                            additional_fields['boothCenterKannada'] = TranslitHelper.translate_to_kannada(clean_val)
+
+                    elif 'house' in key_lower:
+                        additional_fields['houseNo'] = re.sub(r'^(?:HOUSE|H\.?\s*NO|HS|NO|NUM|H)\b[:\- .]*', '', clean_val, flags=re.IGNORECASE).strip()
+
+                    elif any(k in key_lower for k in ['serial', 'assembly', 'ac', 'pc', 'part']):
+                        num_val = re.sub(r'[^0-9/,\-]', '', clean_val)
+                        if 'serial' in key_lower:
+                            additional_fields['serialNo'] = re.sub(r'[^0-9,]', '', num_val)
+                        elif any(k in key_lower for k in ['assembly', 'ac']):
+                            additional_fields['assemblyNo'] = num_val
+                        else:
+                            additional_fields['partNo'] = num_val
+                    
+                    if field_key not in additional_fields:
                         additional_fields[field_key] = clean_val
 
-                    additional_fields[field_key] = clean_val
-                    
-                    # === STANDARDIZE KEYS AND ADD ENGLISH VERSIONS ===
-                    # Map common variations to standard keys expected by Excel generator
-                    if 'name' in key_lower and 'relative' not in key_lower:
-                        additional_fields['name'] = clean_val  # Standard key
-                        additional_fields['nameEnglish'] = TranslitHelper.transliterate_marathi_to_english(clean_val)
-                    elif 'relative' in key_lower and 'name' in key_lower:
-                        additional_fields['relativeName'] = clean_val # Standard key
-                        additional_fields['relativeNameEnglish'] = TranslitHelper.transliterate_marathi_to_english(clean_val)
-                    elif 'gender' in key_lower:
-                         # Use TranslitHelper for mapping to English (Male/Female)
-                         # We already mapped clean_val to 'पु'/'स्री' above, but map_gender handles that too.
-                         additional_fields['gender'] = clean_val # Standard key
-                         additional_fields['genderEnglish'] = TranslitHelper.map_gender(clean_val)
-                    elif 'age' in key_lower:
-                        additional_fields['age'] = clean_val # Standard key
-                    elif 'relation' in key_lower and 'type' in key_lower:
-                        # Ensure the extracted Relation Type is strictly mapped using TranslitHelper
-                        input_val = additional_fields.get('relationType', clean_val)
-                        # Now we keep the Marathi label like 'वडिलांचे' or 'पतीचे'
-                        # Ensure the extracted Relation Type is strictly mapped to codes
-                        input_val = additional_fields.get('relationType', clean_val)
-                        additional_fields['relationType'] = TranslitHelper.map_relation_type(input_val)
-                    elif 'serial' in key_lower:
-                        additional_fields['serialNo'] = clean_val # Standard key
-                    elif 'house' in key_lower:
-                        additional_fields['houseNo'] = clean_val # Standard key
-                    elif any(k in key_lower for k in ['assembly', 'ac']):
-                        additional_fields['assemblyNo'] = clean_val # Standard key
-                    elif any(k in key_lower for k in ['part', 'pc']):
-                        additional_fields['partNo'] = clean_val # Standard key
-                    
-                    print(f"         > {field_key}: '{clean_val}' (Rel: {additional_fields.get('relationType', 'N/A')})")
-                    
+                    print(f"         > {field_key}: {clean_val}")
                 except Exception as ex:
                     print(f"         > {field_key}: Error ({str(ex)})")
-                    additional_fields[field_key] = ""
         
-        # === SMART FALLBACK (MISALIGNED GRID PROTECTION) ===
-        # If critical fields are missing but full_text exists, parse from full_text
-        if full_text and (not additional_fields.get('name') or len(additional_fields.get('name', '')) < 2):
+        # === SMART FALLBACK (GRID PROTECTION) ===
+        if full_text and (not additional_fields.get('nameEnglish') or len(additional_fields.get('nameEnglish', '')) < 2):
             lines = [l.strip() for l in full_text.split('\n') if l.strip()]
             for line in lines:
-                # Own Name is usually first line or follows 'नाव' label without relative prefixes
-                if any(k in line for k in ['नाव', 'नाम']) and not any(k in line for k in ['पती', 'वडिल', 'आई', 'इतर']):
-                    detected = re.sub(r'^(?:नाव|नाम)[:\- .]*', '', line).strip()
+                if any(k in line.lower() for k in ['name', 'nam']) and not any(k in line.lower() for k in ['husband', 'father', 'mother', 'other']):
+                    detected = re.sub(r'^(?:Name|Nam)[:\- .]*', '', line, flags=re.IGNORECASE).strip()
                     if detected and len(detected) > 2:
-                        # Clean up colons from detected name
-                        detected = re.sub(r'[:]', '', detected).strip()
-                        additional_fields['name'] = TranslitHelper.correct_marathi_ocr(detected)
-                        additional_fields['nameEnglish'] = TranslitHelper.transliterate_marathi_to_english(additional_fields['name'])
+                        name = TranslitHelper.sanitize_name(detected)
+                        additional_fields['name'] = name
+                        additional_fields['nameEnglish'] = name
+                        additional_fields['nameKannada'] = TranslitHelper.translate_to_kannada(name)
                         break
 
-        if full_text and (not additional_fields.get('relativeName') or len(additional_fields.get('relativeName', '')) < 2):
-            rel_prefixes = ['पतीचे', 'वडिलांचे', 'आईचे', 'इतर']
+        if full_text and (not additional_fields.get('relativeNameEnglish') or len(additional_fields.get('relativeNameEnglish', '')) < 2):
+            rel_prefixes = ["Husband's", "Father's", "Mother's", "Other"]
             for prefix in rel_prefixes:
-                pattern = f'{prefix}\\s*(?:नाव|नाम)?[:\\- .]*(.*)'
-                match = re.search(pattern, full_text)
+                pattern = f'{re.escape(prefix)}\\s*(?:Name)?[:\\- .]*(.*)'
+                match = re.search(pattern, full_text, flags=re.IGNORECASE)
                 if match:
                     detected = match.group(1).split('\n')[0].strip()
                     if detected and len(detected) > 2:
-                        # Clean up colons from detected relative name
-                        detected = re.sub(r'[:]', '', detected).strip()
-                        additional_fields['relativeName'] = TranslitHelper.correct_marathi_ocr(detected)
-                        additional_fields['relativeNameEnglish'] = TranslitHelper.transliterate_marathi_to_english(additional_fields['relativeName'])
+                        rel_name = TranslitHelper.sanitize_name(detected, is_relative=True)
+                        additional_fields['relativeName'] = rel_name
+                        additional_fields['relativeNameEnglish'] = rel_name
+                        additional_fields['relativeNameKannada'] = TranslitHelper.translate_to_kannada(rel_name)
                         break
 
-        # === AI SMART CORRECTION (DISABLED) ===
-        # if 'name' in additional_fields and 'relativeName' in additional_fields:
-        #     original_name = additional_fields['name']
-        #     relative_name = additional_fields['relativeName']
-        #     
-        #     # Apply Correction
-        #     corrected_name = TranslitHelper.smart_correct_name(original_name, relative_name)
-        #     
-        #     if corrected_name != original_name:
-        #         additional_fields['name'] = corrected_name
-        #         # Update English transliteration too
-        #         additional_fields['nameEnglish'] = TranslitHelper.transliterate_marathi_to_english(corrected_name)
-
         # Return result
-
         result = {
             'page': page_num + 1,
             'column': col + 1,
@@ -1154,30 +877,39 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
             'voterID': voter_id_text if voter_id_text else "",
             'full_text': full_text,
             'image_base64': photo_base64,
+            'name': additional_fields.get('name', ''),
             'nameEnglish': additional_fields.get('nameEnglish', ''),
+            'nameKannada': additional_fields.get('nameKannada', ''),
+            'relativeName': additional_fields.get('relativeName', ''),
             'relativeNameEnglish': additional_fields.get('relativeNameEnglish', ''),
+            'relativeNameKannada': additional_fields.get('relativeNameKannada', ''),
+            'age': additional_fields.get('age', ''),
+            'gender': additional_fields.get('gender', ''),
             'genderEnglish': additional_fields.get('genderEnglish', ''),
-            'relationTypeEnglish': TranslitHelper.transliterate_relation_type(additional_fields.get('relationType', '')),
-            **additional_fields,  # MERGE DYNAMIC FIELDS
+            'genderKannada': additional_fields.get('genderKannada', ''),
+            'relationType': additional_fields.get('relationType', ''),
+            'houseNo': additional_fields.get('houseNo', ''),
+            'serialNo': additional_fields.get('serialNo', ''),
+            'assemblyNo': additional_fields.get('assemblyNo', ''),
+            'partNo': additional_fields.get('partNo', ''),
+            'boothCenter': additional_fields.get('boothCenter', ''),
+            'boothCenterEnglish': additional_fields.get('boothCenterEnglish', ''),
+            'boothCenterKannada': additional_fields.get('boothCenterKannada', ''),
+            'boothAddress': additional_fields.get('boothAddress', ''),
+            'boothAddressEnglish': additional_fields.get('boothAddressEnglish', ''),
+            'boothAddressKannada': additional_fields.get('boothAddressKannada', ''),
             'metadata': {
                 'voter_id_confidence': voter_id_confidence,
                 'photo_quality': photo_quality,
                 'text_method': text_method,
-                'enhanced': local_photo_processor is not None,
-                'has_voter_id': has_valid_voter_id,
-                'has_photo': has_photo,
-                'photo_only': has_photo and not has_valid_voter_id,  
-                'voter_id_only': has_valid_voter_id and not has_photo  
             },
             'stats': cell_stats,
             'skipped': False
         }
-        
-        # doc.close() removed - handled by caller
         return result
         
     except Exception as e:
-        print(f"  ERROR in worker for cell [{cell_info.get('row', '?')+1},{cell_info.get('col', '?')+1}]: {str(e)}")
+        print(f"  ERROR: {str(e)}")
         return {'skipped': True, 'error': str(e)}
 
 def detect_grid_offset(page, config, expected_first_cell_y):
@@ -1186,36 +918,15 @@ def detect_grid_offset(page, config, expected_first_cell_y):
     Returns y_offset (positive = shifted down).
     """
     try:
-        # Strategy: Find the "Anchor Row" containing labels like "Name", "Age", "Gender"
-        # The header height is variable, but the internal cell structure is constant.
-        # If we find "Name" at Y=250 instead of Y=200, we know the offset is +50.
-        
         # Search area: Top 40% of page
         page_h = page.rect.height
         search_rect = fitz.Rect(0, 0, page.rect.width, page_h * 0.4)
-        
         words = page.get_text("words", clip=search_rect)
         
-        # Filter for anchors
-        # "Name" in Marathi is "नाव" or "Naav"
-        # "Age" in Marathi is "वय" or "Age"
-        # "Gender" is "लिंग" or "Ling"
-        
-        # We look for the finding the FIRST occurrence of these that looks like a grid row
+        # Look for English anchors
         anchors_y = []
         for w in words:
-            text = w[4].strip()
-            # Check matches (English or Marathi)
-            if 'नाव' in text or 'Name' in text or 'Age' in text or 'वय' in text or 'लिंग' in text:
-                 # Check if it's not too close to top (header title might have these words?)
-                 # Usually grid starts > 100px
-                 if w[1] > 50:
-                     anchors_y.append(w[1])
-        
-        if not anchors_y:
-            return 0
-            
-        # Cluster Y values to find lines (within 5px)
+            text = w[4].strip().lower()
         anchors_y.sort()
         
         # Find the first "cluster" of Y values. This corresponds to the first row of cells (Row 1).
@@ -1337,118 +1048,112 @@ def is_cell_empty(pix_or_img, threshold=500):
 
 def detect_page_alignment(page, config, file_id=None):
     """
-    Detects the 'Anchor' Y position dynamically.
-    OPTIMIZATION (Option 3):
-    1. Caching: Reuse header height if file_id provided.
-    2. Speed: Use 150 DPI (zoom=0.5) + CV2 HoughLines.
+    Detects the 'Anchor' Y position dynamically using multiple strategies:
+    1. CV2 Horizontal Lines (Header-Grid separator)
+    2. Text Anchors ("Name", "Age", "नाव", "वय")
+    3. Voter ID Patterns (EPIC)
     """
     try:
         # 1. CHECK CACHE
         grid_y = config.get('grid', {}).get('y', 0)
+        page_h = page.rect.height
         
         if file_id and file_id in ALIGNMENT_CACHE:
             cached_offset = ALIGNMENT_CACHE[file_id]
-            print(f"      ⚡ Cache Hit: Using cached offset {cached_offset:.1f}")
-            return cached_offset
+            # Verify if cached offset is sane
+            if abs(cached_offset) < page_h * 0.5:
+                return cached_offset
 
-        search_region_h = max(grid_y + 300, 500)
-        
-        # 2. FAST CV2 LINE DETECTION (150 DPI)
-        # 150 DPI is enough for layout lines. Zoom = 150/72 ~= 2.0. Let's use 1.5 (~108 DPI) or 2.0 (144 DPI)
-        # User suggested 150 DPI.
-        zoom = 150 / 72.0 
-        mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat, clip=fitz.Rect(0, 0, page.rect.width, search_region_h))
-        
-        import cv2
-        import numpy as np
-        
-        img_bytes = pix.tobytes("png")
-        nparr = np.frombuffer(img_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
-        
-        # Canny + HoughLinesP
-        edges = cv2.Canny(img, 50, 150, apertureSize=3)
-        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100, minLineLength=100, maxLineGap=10)
-        
-        detected_y_pdf = None
-        
-        if lines is not None:
-            # Filter for Horizontal Lines
-            h_lines = []
-            for line in lines:
-                x1, y1, x2, y2 = line[0]
-                if abs(y1 - y2) < 5: # Horizontal
-                     h_lines.append(y1)
+        # Search area: Top 50% of page
+        search_region_h = page_h * 0.5
+        search_rect = fitz.Rect(0, 0, page.rect.width, search_region_h)
+
+        # STRATEGY 1: CV2 Horizontal Lines (Highly Reliable for clean scans)
+        try:
+            zoom = 150 / 72.0 
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat, clip=search_rect)
             
-            if h_lines:
-                h_lines.sort()
-                
-                # We want the 'First Major Line' that represents the Grid Top
-                # This logic depends on where the grid starts relative to the header.
-                # Let's find the line closest to our EXPECTED grid_y
-                
-                expected_y_px = grid_y * zoom
-                closest_y_px = min(h_lines, key=lambda y: abs(y - expected_y_px))
-                
-                # If it's reasonable match (< 500px diff scaled)
-                if abs(closest_y_px - expected_y_px) < (500 * zoom):
-                     detected_y_pdf = closest_y_px / zoom
-                     
-        if detected_y_pdf is not None:
-             offset = detected_y_pdf - grid_y
-             print(f"      ⚓ Smart Align (CV2): Found Grid Line at {detected_y_pdf:.1f} (Exp {grid_y}), Offset={offset:.1f}")
-             
-             # UPDATE CACHE
-             if file_id:
-                 ALIGNMENT_CACHE[file_id] = offset
-             return offset
+            import cv2
+            import numpy as np
+            
+            img_bytes = pix.tobytes("png")
+            nparr = np.frombuffer(img_bytes, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+            
+            # Canny + HoughLinesP
+            edges = cv2.Canny(img, 50, 150, apertureSize=3)
+            lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100, minLineLength=200, maxLineGap=10)
+            
+            if lines is not None:
+                h_lines = sorted([line[0][1] / zoom for line in lines if abs(line[0][1] - line[0][3]) < 5])
+                if h_lines:
+                    # Find first major line starting after 100pt (likely top of grid)
+                    for find_y in h_lines:
+                        if find_y > 100:
+                            offset = find_y - grid_y
+                            if abs(offset) < page_h * 0.4:
+                                print(f"      ⚓ Smart Align (Lines): Found at {find_y:.1f}, Offset={offset:.1f}")
+                                if file_id: ALIGNMENT_CACHE[file_id] = offset
+                                return offset
+        except: pass
 
-        # STRATEGY 2: Fallback to Voter ID Regex (Original Logic) but DEEPER SEARCH
-        # print("      ⚠️  CV2 Lines failed, falling back to Voter ID Regex...")
+        # STRATEGY 2: Text Anchors (नाव, Name, वय, Age)
+        words = page.get_text("words", clip=search_rect)
+        anchors_y = []
+        for w in words:
+            text = w[4].strip()
+            # Look for common labels found in every voter record
+            if any(k in text for k in ['नाव', 'Name', 'Age', 'वय', 'लिंग', 'Gender', 'Husband', 'Father']):
+                if w[1] > 100: # Below header
+                    anchors_y.append(w[1])
         
-        # INCREASED SEARCH REGION for high headers (up to 70% of page)
-        deep_search_h = max(search_region_h, page.rect.height * 0.7)
-        
-        text_words = page.get_text("words", clip=fitz.Rect(0, 0, page.rect.width, deep_search_h))
+        if anchors_y:
+            anchors_y.sort()
+            # Topmost label. In template, 'Name' might be at grid_y + 20
+            # Let's assume the first label defines the top of the grid
+            first_label_y = anchors_y[0]
+            
+            # Search for relative Y of 'Name' or 'Serial No' in template
+            cell_template = config.get('cellTemplate', {})
+            fields = cell_template.get('fields', {})
+            rel_y = 20 # Default guess
+            for fk, fv in fields.items():
+                if 'name' in fk.lower() or 'serial' in fk.lower():
+                    rel_y = fv.get('y', 20)
+                    break
+            
+            actual_grid_y = first_label_y - rel_y
+            offset = actual_grid_y - grid_y
+            if abs(offset) < page_h * 0.4:
+                print(f"      ⚓ Smart Align (Labels): Found at {actual_grid_y:.1f}, Offset={offset:.1f}")
+                if file_id: ALIGNMENT_CACHE[file_id] = offset
+                return offset
+
+        # STRATEGY 3: Voter ID Regex (Original Fallback)
         voter_id_candidates = []
-        
-        # Use pre-compiled regex patterns for better performance
-        for w in text_words:
+        for w in words:
             text = w[4].strip().upper().replace(" ", "")
-            # Check detailed patterns
-            if EPIC_REGEX.match(text) or LOOSE_EPIC_REGEX.match(text) or re.match(r'^[A-Z]{2,3}/[0-9]+/[0-9]+', text):
-                voter_id_candidates.append(w[1]) # Append Y coordinate
+            if EPIC_REGEX.match(text) or LOOSE_EPIC_REGEX.match(text):
+                voter_id_candidates.append(w[1])
 
         if voter_id_candidates:
-            voter_id_candidates.sort() # Topmost first
-            
-            # Use the topmost, but verify it's not "too high" (noise) or "too low" (footer) if possible.
-            # Usually the first one is the top-left cell or top-middle.
+            voter_id_candidates.sort()
             first_id_y = voter_id_candidates[0]
             
             cell_template = config.get('cellTemplate', {})
-            voter_id_box = cell_template.get('voterIdBox', {})
-            vid_rel_y = voter_id_box.get('y', 10) 
-            
-            # The EXPECTED Grid Y derived from this found ID
-            # found_y = grid_y + vid_rel_y
-            # So: grid_y = found_y - vid_rel_y
-            
-            # Calculate offset relative to configured grid_y
-            # Offset = Actual_Grid_Start - Config_Grid_Start
-            # Actual_Grid_Start = first_id_y - vid_rel_y
+            vid_box = cell_template.get('voterIdBox', {})
+            vid_rel_y = vid_box.get('y', 10) 
             
             actual_grid_y = first_id_y - vid_rel_y
             offset = actual_grid_y - grid_y
             
-            # Allow large offsets (up to 2000px) because header can be huge
-            if abs(offset) < 2000:
-                print(f"      ⚓ Smart Align (Deep ID): Found ID at {first_id_y:.1f}, Offset={offset:.1f}")
+            if abs(offset) < page_h * 0.4:
+                print(f"      ⚓ Smart Align (EPIC): Found at {actual_grid_y:.1f}, Offset={offset:.1f}")
                 if file_id: ALIGNMENT_CACHE[file_id] = offset
                 return offset
 
-        return 0.0 # No offset found
+        return 0.0
     except Exception as e:
         print(f"      ⚠️  Alignment Error: {e}")
         return 0.0
@@ -1624,37 +1329,61 @@ def process_single_page_worker(task_info):
             print(f"      ⚠️  Auto-Grid Detection Error: {e}")
             detected_cells = []
 
-        cells_to_process = []
+        # === GENERATE CELLS (ZERO-SKIP ARCHITECTURE) ===
+        # We ALWAYS generate a full grid based on rows/cols to ensure no data is skipped.
+        # BoxDetector is used as a 'Refinement' - if it finds a box close to our grid cell,
+        # we adopt the detected coordinates for better accuracy.
         
-        # DECISION: Use Detected Grid vs Static Config
-        if detected_cells and len(detected_cells) > 5:
-             cells_to_process = detected_cells
-        else:
-             print("      ⚠️  Using Manual Grid Config (Fallback)")
-             # Fallback to static grid generation
-             for col in range(grid_cols):
-                 for row in range(grid_rows):
-                     if col_positions and row_positions:
-                         cx = col_positions[col] if col < len(col_positions) else grid_x + (col * cell_width)
-                         cy = row_positions[row] if row < len(row_positions) else grid_y + (row * cell_height)
-                         cw = (col_positions[col+1] - col_positions[col]) if col+1 < len(col_positions) else (grid_x+grid_width-cx)
-                         ch = (row_positions[row+1] - row_positions[row]) if row+1 < len(row_positions) else (grid_y+grid_height-cy)
-                     else:
-                         cx = grid_x + (col * cell_width)
-                         cy = grid_y + (row * cell_height)
-                         cw, ch = cell_width, cell_height
-                     
-                     # Apply offset (Only for Static Grid)
-                     cy += y_offset
-                         
-                     cells_to_process.append({
-                         'x': cx, 'y': cy, 'width': cw, 'height': ch,
-                         'row': row, 'col': col,
-                         'scale_x': cw / first_cell_width,
-                         'scale_y': ch / first_cell_height,
-                         'first_cell_width': first_cell_width,
-                         'first_cell_height': first_cell_height
-                     })
+        manual_grid_cells = []
+        for row in range(grid_rows):
+            for col in range(grid_cols):
+                if col_positions and row_positions:
+                    cx = col_positions[col] if col < len(col_positions) else grid_x + (col * cell_width)
+                    cy = row_positions[row] if row < len(row_positions) else grid_y + (row * cell_height)
+                    cw = (col_positions[col+1] - col_positions[col]) if col+1 < len(col_positions) else (grid_x+grid_width-cx)
+                    ch = (row_positions[row+1] - row_positions[row]) if row+1 < len(row_positions) else (grid_y+grid_height-cy)
+                else:
+                    cx = grid_x + (col * cell_width)
+                    cy = grid_y + (row * cell_height)
+                    cw, ch = cell_width, cell_height
+                
+                # Apply global offset detected earlier
+                cy += y_offset
+                
+                manual_grid_cells.append({
+                    'x': cx, 'y': cy, 'width': cw, 'height': ch,
+                    'row': row, 'col': col,
+                    'scale_x': cw / first_cell_width if first_cell_width else 1.0,
+                    'scale_y': ch / first_cell_height if first_cell_height else 1.0,
+                    'first_cell_width': first_cell_width,
+                    'first_cell_height': first_cell_height,
+                    'aligned': False
+                })
+
+        cells_to_process = manual_grid_cells
+        
+        # USE BOX DETECTOR FOR REFINEMENT (If available)
+        if detected_cells and len(detected_cells) >= 3:
+             print(f"      📦 Refining {len(cells_to_process)} cells with {len(detected_cells)} detected boxes...")
+             for m_cell in cells_to_process:
+                  # Find the best matching detected cell
+                  for d_cell in detected_cells:
+                       # Match by spatial proximity (Center point)
+                       m_center_x = m_cell['x'] + m_cell['width']/2
+                       m_center_y = m_cell['y'] + m_cell['height']/2
+                       d_center_x = d_cell['x'] + d_cell['width']/2
+                       d_center_y = d_cell['y'] + d_cell['height']/2
+                       
+                       dist = ((m_center_x - d_center_x)**2 + (m_center_y - d_center_y)**2)**0.5
+                       
+                       # If match is within 50px, refine the coordinates
+                       if dist < 50:
+                            m_cell['x'] = d_cell['x']
+                            m_cell['y'] = d_cell['y']
+                            m_cell['width'] = d_cell['width']
+                            m_cell['height'] = d_cell['height']
+                            m_cell['aligned'] = True
+                            break
 
         # Initialize processors locally
         processors = {
@@ -1730,20 +1459,16 @@ def process_single_page_worker(task_info):
                         # We use a small fraction of offset for header if it's very large
                         # But typically header elements relate to page top 
                         
-                        # Crop from master image for speed and quality
-                        cropped_field_img = None
-                        if master_page_img:
-                            left = r_x * master_page_scale
-                            top = r_y * master_page_scale
-                            right = (r_x + r_w) * master_page_scale
-                            bottom = (r_y + r_h) * master_page_scale
-                            cropped_field_img = master_page_img.crop((left, top, right, bottom))
+                        # HIGH QUALITY: RENDER FIELD AT 400 DPI
+                        field_pix_high = page.get_pixmap(clip=full_rect, dpi=400, alpha=False)
+                        cropped_field_img = Image.frombytes("RGB", [field_pix_high.width, field_pix_high.height], field_pix_high.samples)
 
                         # Determine if this is a booth-related field (Center or Address)
                         is_booth_field = any(k in field_key.lower() for k in ['booth', 'center', 'address'])
                         
-                        # Rule: For booth fields, do NOT force Marathi-only
-                        force_marathi_val = not is_booth_field
+                        # Rule: Enable English OCR but keep a flag for transliteration if needed
+                        # User wants English output, so we default to English OCR
+                        force_marathi_val = False 
                         
                         field_res = processors['ocr'].extract_full_cell_text(
                             image=cropped_field_img,
@@ -1765,17 +1490,15 @@ def process_single_page_worker(task_info):
                         
                         page_data[field_key] = val
                         
-                        # Populate English variant
+                        # Populate English and Kannada variants
                         if val:
                             try:
-                                # RULE: If the field already contains English characters, use it directly
-                                if re.search(r'[a-zA-Z]', val):
-                                    page_data[f"{field_key}English"] = val
-                                else:
-                                    english_val = TranslitHelper.transliterate_marathi_to_english(val)
-                                    page_data[f"{field_key}English"] = english_val
+                                page_data[field_key] = val # Already English
+                                page_data[f"{field_key}English"] = val
+                                page_data[f"{field_key}Kannada"] = TranslitHelper.translate_to_kannada(val)
                             except:
                                 page_data[f"{field_key}English"] = ""
+                                page_data[f"{field_key}Kannada"] = ""
                                 
                     except Exception as e:
                         print(f"      ⚠️  Header field {field_key} error: {e}")
@@ -1818,8 +1541,10 @@ def process_single_page_worker(task_info):
                                      try:
                                          if re.search(r'[a-zA-Z]', detected_val):
                                              page_data['boothCenterEnglish'] = detected_val
+                                             page_data['boothCenterKannada'] = TranslitHelper.translate_to_kannada(detected_val)
                                          else:
                                              page_data['boothCenterEnglish'] = TranslitHelper.transliterate_marathi_to_english(detected_val)
+                                             page_data['boothCenterKannada'] = TranslitHelper.transliterate_marathi_to_kannada(detected_val)
                                      except: pass
                                      break
                          
@@ -1839,8 +1564,10 @@ def process_single_page_worker(task_info):
                                      try:
                                          if re.search(r'[a-zA-Z]', detected_val):
                                              page_data['boothAddressEnglish'] = detected_val
+                                             page_data['boothAddressKannada'] = TranslitHelper.translate_to_kannada(detected_val)
                                          else:
                                              page_data['boothAddressEnglish'] = TranslitHelper.transliterate_marathi_to_english(detected_val)
+                                             page_data['boothAddressKannada'] = TranslitHelper.transliterate_marathi_to_kannada(detected_val)
                                      except: pass
                                      break
                  except: pass
@@ -1862,15 +1589,17 @@ def process_single_page_worker(task_info):
                 for pk, pv in page_data.items():
                     result[pk] = pv
                 
-                # Transliterate Cell Fields (copy existing logic)
+                # Transliterate Cell Fields (English Mode)
                 try:
-                    name_marathi = result.get('name', '')
-                    if name_marathi:
-                        result['nameEnglish'] = TranslitHelper.transliterate_marathi_to_english(name_marathi)
+                    name_eng = result.get('name', '')
+                    if name_eng:
+                        result['nameEnglish'] = name_eng
+                        result['nameKannada'] = TranslitHelper.translate_to_kannada(name_eng)
                     
-                    rel_name_marathi = result.get('relativeName', '')
-                    if rel_name_marathi:
-                        result['relativeNameEnglish'] = TranslitHelper.transliterate_marathi_to_english(rel_name_marathi)
+                    rel_name_eng = result.get('relativeName', '')
+                    if rel_name_eng:
+                        result['relativeNameEnglish'] = rel_name_eng
+                        result['relativeNameKannada'] = TranslitHelper.translate_to_kannada(rel_name_eng)
                 except:
                     pass
             
@@ -2143,7 +1872,8 @@ def process_page(pdf_path, page_num, config, template, box_detector_config=None)
                         
                         # Determine if this is a booth-related field
                         is_booth_field = any(k in field_key.lower() for k in ['booth', 'center', 'address'])
-                        force_marathi_val = not is_booth_field
+                        # Rule: Force English OCR as requested by User
+                        force_marathi_val = False 
                         
                         field_res = processors['ocr'].extract_full_cell_text(
                             image=cropped_field_img,
@@ -2167,24 +1897,30 @@ def process_page(pdf_path, page_num, config, template, box_detector_config=None)
                         
                         if val:
                             try:
-                                # RULE: Transliterate to English if Devanagari is present
+                                # RULE: Transliterate to English/Kannada if Devanagari is present
                                 if any('\u0900' <= char <= '\u097F' for char in val):
-                                     english_val = TranslitHelper.transliterate_marathi_to_english(val)
-                                     page_data[f"{field_key}English"] = english_val
+                                     eng_v = TranslitHelper.transliterate_marathi_to_english(val)
+                                     page_data[field_key] = eng_v # Force English in base field
+                                     page_data[f"{field_key}English"] = eng_v
+                                     page_data[f"{field_key}Kannada"] = TranslitHelper.transliterate_marathi_to_kannada(val)
                                 else:
+                                     page_data[field_key] = val
                                      page_data[f"{field_key}English"] = val
+                                     page_data[f"{field_key}Kannada"] = TranslitHelper.translate_to_kannada(val)
                             except:
                                 page_data[f"{field_key}English"] = ""
+                                page_data[f"{field_key}Kannada"] = ""
                     except Exception as e:
                         pass
 
              # === SMART FALLBACK: Search for missing booth info if not found via template ===
              if (not page_data.get('boothCenter') or len(page_data.get('boothCenter', '')) < 5) and master_page_img:
                  try:
-                     # OPTIMIZATION: Use master image instead of rendering again
+                     # Scan Top 15% of the page
                      header_h = int(page.rect.height * 0.15)
                      header_img = master_page_img.crop((0, 0, int(page.rect.width * master_page_scale), int(header_h * master_page_scale)))
                      
+                     # Force English OCR (False) to avoid Marathi input as requested
                      header_res = processors['ocr'].extract_full_cell_text(image=header_img, force_marathi=False)
                      header_text = header_res.get('raw_text', '')
                      if header_text:
@@ -2202,8 +1938,10 @@ def process_page(pdf_path, page_num, config, template, box_detector_config=None)
                                          # RULE: Transliterate to English if Devanagari is present
                                          if any('\u0900' <= char <= '\u097F' for char in det):
                                              page_data['boothCenterEnglish'] = TranslitHelper.transliterate_marathi_to_english(det)
+                                             page_data['boothCenterKannada'] = TranslitHelper.transliterate_marathi_to_kannada(det)
                                          else:
                                              page_data['boothCenterEnglish'] = det
+                                             page_data['boothCenterKannada'] = TranslitHelper.translate_to_kannada(det)
                                      except: pass
                                      break
                          # Booth Address patterns
@@ -2220,8 +1958,10 @@ def process_page(pdf_path, page_num, config, template, box_detector_config=None)
                                          # RULE: Transliterate to English if Devanagari is present
                                          if any('\u0900' <= char <= '\u097F' for char in det):
                                              page_data['boothAddressEnglish'] = TranslitHelper.transliterate_marathi_to_english(det)
+                                             page_data['boothAddressKannada'] = TranslitHelper.transliterate_marathi_to_kannada(det)
                                          else:
                                              page_data['boothAddressEnglish'] = det
+                                             page_data['boothAddressKannada'] = TranslitHelper.translate_to_kannada(det)
                                      except: pass
                                      break
                  except: pass
@@ -2246,12 +1986,30 @@ def process_page(pdf_path, page_num, config, template, box_detector_config=None)
                 try:
                     name_marathi = result.get('name', '')
                     if name_marathi:
-                        result['nameEnglish'] = TranslitHelper.transliterate_marathi_to_english(name_marathi)
+                        eng_name = TranslitHelper.transliterate_marathi_to_english(name_marathi)
+                        result['nameEnglish'] = eng_name
+                        
+                        # PRIORITY: High-accuracy offline transliteration from Marathi
+                        if any('\u0900' <= char <= '\u097F' for char in name_marathi):
+                            result['nameKannada'] = TranslitHelper.transliterate_marathi_to_kannada(name_marathi)
+                        else:
+                            # Fallback: Translate from English (Google / ITRANS)
+                            result['nameKannada'] = TranslitHelper.translate_to_kannada(eng_name)
                     
                     rel_name_marathi = result.get('relativeName', '')
                     if rel_name_marathi:
-                        result['relativeNameEnglish'] = TranslitHelper.transliterate_marathi_to_english(rel_name_marathi)
-                except:
+                        eng_rel_name = TranslitHelper.transliterate_marathi_to_english(rel_name_marathi)
+                        result['relativeNameEnglish'] = eng_rel_name
+                        
+                        # PRIORITY: High-accuracy offline transliteration from Marathi
+                        if any('\u0900' <= char <= '\u097F' for char in rel_name_marathi):
+                            result['relativeNameKannada'] = TranslitHelper.transliterate_marathi_to_kannada(rel_name_marathi)
+                        else:
+                            # Fallback: Translate from English (Google / ITRANS)
+                            result['relativeNameKannada'] = TranslitHelper.translate_to_kannada(eng_rel_name)
+                            
+                except Exception as e:
+                    print(f"      Translation error in worker: {e}")
                     pass
             
             page_results.append(result)
@@ -2356,7 +2114,7 @@ def extract_grid_vertical_enhanced(pdf_bytes, config, pdf_path=None):
             except Exception as e:
                 print(f"Parallel execution failed: {e}")
         else:
-             results_flat = [item for t in page_tasks for item in process_single_page_worker(t)]
+             results_flat = [item for t in work_items for item in process_single_page_worker(t)]
 
         print(f"Parallel time: {time.time() - parallel_start:.2f}s")
         
@@ -2391,7 +2149,7 @@ def extract_grid_vertical_enhanced(pdf_bytes, config, pdf_path=None):
                 # Faster numeric extraction
                 digits = "".join(filter(str.isdigit, s))
                 if digits: return (0, int(digits))
-            return (1, x.get('page', 0), x.get('column', 0), x.get('row', 0))
+            return (1, x.get('page', 0), x.get('row', 0), x.get('col', 0))
 
         extracted_data.sort(key=get_sort_key)
         

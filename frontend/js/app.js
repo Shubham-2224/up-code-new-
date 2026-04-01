@@ -585,18 +585,18 @@ function handlePreview() {
                 <td>${record.serialNo || '-'}</td>
                 <td class="voter-id-cell">${record.voterID || '<span class="no-data">No ID</span>'}</td>
                 <td>${record.name || '-'}</td>
-                <td>${record.nameEnglish || '-'}</td>
+                <td>${record.nameKannada || '-'}</td>
                 <td>${record.relationType || '-'}</td>
                 <td>${record.relativeName || '-'}</td>
-                <td>${record.relativeNameEnglish || '-'}</td>
+                <td>${record.relativeNameKannada || '-'}</td>
                 <td>${record.houseNo || '-'}</td>
                 <td>${record.gender || '-'}</td>
                 <td>${record.age || '-'}</td>
                 <td>${record.assemblyNo || '-'}</td>
                 <td>${record.boothCenter || '-'}</td>
-                <td>${record.boothCenterEnglish || '-'}</td>
+                <td>${record.boothCenterKannada || '-'}</td>
                 <td>${record.boothAddress || '-'}</td>
-                <td>${record.boothAddressEnglish || '-'}</td>
+                <td>${record.boothAddressKannada || '-'}</td>
                 <td class="photo-cell">
                     ${record.image_base64
                 ? `<img src="data:image/jpeg;base64,${record.image_base64}" 

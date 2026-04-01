@@ -40,14 +40,14 @@ def generate_excel(data: List[Dict], output_path: str) -> bool:
         headers = [
             'Serial No', 
             'EPIC No', 
-            'Name', 'Name (English)', 
+            'Name', 'Name (English)', 'Name (Kannada)',
             'Relation Type', 
-            'Relative Name', 'Relative Name (English)', 
+            'Relative Name', 'Relative Name (English)', 'Relative Name (Kannada)',
             'House No', 
             'Gender', 
             'Age', 'Assembly No',
-            'Booth Center', 'Booth Center (English)',
-            'Booth Address', 'Booth Address (English)',
+            'Booth Center', 'Booth Center (English)', 'Booth Center (Kannada)',
+            'Booth Address', 'Booth Address (English)', 'Booth Address (Kannada)',
             'Prabhag', 'Booth No'
         ]
         
@@ -75,8 +75,8 @@ def generate_excel(data: List[Dict], output_path: str) -> bool:
             
             # Set default widths for standard columns, then auto for images
             col_letter = get_column_letter(col_num)
-            if col_num <= 17:
-                standard_widths = [10, 15, 25, 25, 15, 25, 25, 10, 8, 8, 12, 30, 30, 30, 30, 15, 15]
+            if col_num <= 21: # Increased from 19 to 21 because of 2 new columns
+                standard_widths = [10, 15, 25, 25, 25, 15, 25, 25, 25, 10, 8, 8, 12, 30, 30, 30, 30, 30, 30, 15, 15]
                 worksheet.column_dimensions[col_letter].width = standard_widths[col_num-1]
             else:
                 worksheet.column_dimensions[col_letter].width = 25 # Image B64 columns
@@ -89,18 +89,16 @@ def generate_excel(data: List[Dict], output_path: str) -> bool:
             bottom=Side(style='thin')
         )
         
-        # Sort data by Serial No before writing
-        def get_serial_key(rec):
-            try:
-                val = rec.get('serialNo') or rec.get('Serial No') or rec.get('serial_no') or ''
-                digits = ''.join(c for c in str(val) if c.isdigit())
-                if digits:
-                    return (0, int(digits))
-            except:
-                pass
-            return (1, rec.get('page', 0), rec.get('column', 0), rec.get('row', 0))
+        # Sort data by Page, then Row, then Column (Perfect Spatial Row-wise Order)
+        def get_spatial_key(rec):
+            # Page, Row, Column (1-indexed based on dict)
+            return (
+                rec.get('page', 0), 
+                rec.get('row', 0), 
+                rec.get('column', 0)
+            )
 
-        data.sort(key=get_serial_key)
+        data.sort(key=get_spatial_key)
 
         # Add data rows
         for index, record in enumerate(data):
@@ -112,17 +110,21 @@ def generate_excel(data: List[Dict], output_path: str) -> bool:
                 record.get('voterID', ''),
                 record.get('name', ''),
                 record.get('nameEnglish', ''),
+                record.get('nameKannada', ''),
                 record.get('relationType', ''),
                 record.get('relativeName', ''),
                 record.get('relativeNameEnglish', ''),
+                record.get('relativeNameKannada', ''),
                 record.get('houseNo', ''),
                 record.get('gender', ''),
                 record.get('age', ''),
                 record.get('assemblyNo', ''),
                 record.get('boothCenter', ''),
                 record.get('boothCenterEnglish', ''),
+                record.get('boothCenterKannada', ''),
                 record.get('boothAddress', ''),
                 record.get('boothAddressEnglish', ''),
+                record.get('boothAddressKannada', ''),
                 record.get('prabhag', ''),
                 record.get('boothNo', '')
             ]

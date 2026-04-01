@@ -56,10 +56,14 @@ class SmartDetector:
             else:
                 gray_image = cell_image
             
+            # WATERMARK SUPPRESSION: Force light-gray pixels (160-255) to pure white.
+            # Highly effective against "STATE ELECTION COMMISSION" watermarks.
+            gray_image = gray_image.point(lambda p: 255 if p > 160 else p)
+            
             # Try to extract all text from the cell
             text = pytesseract.image_to_string(
                 gray_image,
-                lang='eng+hin',
+                lang='eng',
                 config='--psm 6'
             ).strip()
             
@@ -128,18 +132,18 @@ class SmartDetector:
         # Find all potential voter IDs
         candidates = []
         
-        # Pattern 1: ABC1234567 format
+        # Pattern 1: ABC1234567 (Strict 3-7)
         matches = re.findall(r'[A-Z]{3}[0-9]{7}', text)
         candidates.extend(matches)
         
-        # Pattern 2: Long alphanumeric (10+ chars)
+        # Pattern 2: Any 10 alphanumeric block (to be cleaned later)
         if not candidates:
-            matches = re.findall(r'[A-Z0-9]{10,}', text)
+            matches = re.findall(r'[A-Z0-9]{10}', text)
             candidates.extend(matches)
         
-        # Pattern 3: Any sequence with both letters and numbers
+        # Pattern 3: Any sequence with both letters and numbers (8-12 chars)
         if not candidates:
-            matches = re.findall(r'(?=.*[A-Z])(?=.*[0-9])[A-Z0-9]{8,}', text)
+            matches = re.findall(r'(?=.*[A-Z])(?=.*[0-9])[A-Z0-9]{8,12}', text)
             candidates.extend(matches)
         
         return candidates
