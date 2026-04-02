@@ -242,8 +242,10 @@ class OCRProcessor400DPI:
                 image = image.convert('L')
                 
                 # WATERMARK SUPPRESSION: Force light-gray pixels (140-255) to pure white.
+                # Performance Optimization: Use LUT (Look-Up Table) instead of slow lambda
                 # Highly effective against "STATE ELECTION COMMISSION" watermarks.
-                image = image.point(lambda p: 255 if p > 140 else p)
+                lut = [255 if p > 140 else p for p in range(256)]
+                image = image.point(lut)
                 
                 # 4. Denoise
                 if not skip_heavy_ops:

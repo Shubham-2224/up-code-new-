@@ -112,7 +112,7 @@ def get_cpu_count():
 CPU_WORKERS = get_cpu_count()
 # CPU optimization enabled - using all cores
 
-def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits, processors, master_page_img=None, master_page_scale=None):
+def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits, processors, master_page_img=None, master_page_scale=None, page_spatial_cache=None):
     """
     Internal function to process a cell given an open page and processors.
     Refactored for page-level optimization.
@@ -696,25 +696,49 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                 text_method = "pdf_text_layer"
             
             else:
-                # Scanned PDF or broken text layer -> Use OCR
-                print(f"      📄 No digital text found. Using Intelligent OCR...")
-                
-                if local_ocr_processor:
-                    # Render full cell at 400 DPI for high fidelity
-                    cell_full_pix = page.get_pixmap(clip=cell_full_rect, dpi=400, alpha=False)
-                    cell_full_crop = Image.frombytes("RGB", [cell_full_pix.width, cell_full_pix.height], cell_full_pix.samples)
+                # 2. Try Page-Wide Spatial Index (Ultimate Speedup)
+                full_text = ""
+                if page_spatial_cache:
+                    try:
+                        ocr_data = page_spatial_cache['data']
+                        sx, sy = page_spatial_cache['scale']
+                        
+                        # Target Rect in OCR pixels for this specific voter cell
+                        tx0, ty0 = cell_full_rect.x0 * sx, cell_full_rect.y0 * sy
+                        tx1, ty1 = cell_full_rect.x1 * sx, cell_full_rect.y1 * sy
+                        
+                        cell_words = []
+                        # Scan spatial data for words intersecting this cell
+                        for i in range(len(ocr_data['text'])):
+                            word = ocr_data['text'][i]
+                            if not word or not word.strip(): continue
+                            
+                            # Center point of word in OCR pixels
+                            wx = ocr_data['left'][i] + ocr_data['width'][i]/2
+                            wy = ocr_data['top'][i] + ocr_data['height'][i]/2
+                            
+                            if tx0 <= wx <= tx1 and ty0 <= wy <= ty1:
+                                cell_words.append(word)
+                        
+                        if cell_words:
+                            full_text = " ".join(cell_words).strip()
+                            text_method = "page_spatial_index"
+                    except Exception as spatial_err:
+                        # print(f"      Spatial Index Error: {spatial_err}")
+                        full_text = ""
 
-                    # Forced English Mode
-                    res = local_ocr_processor.extract_full_cell_text(
-                        image=cell_full_crop, 
-                        pdf_page=None, 
-                        rect=None,
-                        force_marathi=False
-                    )
-                    
-                    full_text = res.get('text', '')
-                    text_method = res.get('method', 'ocr_error')
-                    print(f"      ✅ Cell OCR Complete ({text_method})")
+                # 3. Last Resort: Independent Cell-Specific OCR
+                if not full_text:
+                    print(f"      📄 No indexed text. Using Cell-Specific OCR...")
+                    if local_ocr_processor:
+                        # Render full cell at high fidelity
+                        cell_full_pix = page.get_pixmap(clip=cell_full_rect, dpi=400, alpha=False)
+                        cell_full_crop = Image.frombytes("RGB", [cell_full_pix.width, cell_full_pix.height], cell_full_pix.samples)
+
+                        res = local_ocr_processor.extract_full_cell_text(image=cell_full_crop, force_marathi=False)
+                        full_text = res.get('text', '')
+                        text_method = res.get('method', 'ocr_error')
+                        print(f"      ✅ Cell OCR Complete ({text_method})")
         
         except Exception as e:
             print(f"      ⚠️  Text Extraction Error: {str(e)}")
@@ -724,14 +748,15 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
         fields_config = cell_template.get('fields', {})
         
         if local_ocr_processor and fields_config:
-            try:
-                # Master crop for faster sub-field extraction
-                master_cell_pix = page.get_pixmap(clip=cell_full_rect, dpi=400, alpha=False)
-                master_cell_img = Image.frombytes("RGB", [master_cell_pix.width, master_cell_pix.height], master_cell_pix.samples)
-                px_scale_x = master_cell_pix.width / cell_full_rect.width
-                px_scale_y = master_cell_pix.height / cell_full_rect.height
-            except Exception as e:
-                master_cell_img = None
+            # PERFORMANCE OPTIMIZATION: Render whole cell AT ONCE at high DPI
+            # This avoids calling get_pixmap 5-6 times per voter (huge speedup)
+            master_dpi = 350 # Reduced from 400 to 350 for speed balance (accuracy still high)
+            master_pix = page.get_pixmap(clip=cell_full_rect, dpi=master_dpi, alpha=False)
+            master_img = Image.frombytes("RGB", [master_pix.width, master_pix.height], master_pix.samples)
+            
+            # Coordinate scaling for crops
+            px_scale_x = master_pix.width / cell_full_rect.width
+            px_scale_y = master_pix.height / cell_full_rect.height
 
             for field_key, field_box in fields_config.items():
                 if field_key in ['voterID', 'photo']: continue
@@ -764,7 +789,6 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                     
                     # Strategy for High Speed & Accuracy: Robust Digital Text Extraction
                     use_layer_text = False
-                    # Initialize defaults to avoid UnboundLocalError
                     clean_val = ""
                     raw_text = ""
                     field_res = {}
@@ -774,9 +798,7 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                         layer_rect = fitz.Rect(field_rect.x0 - 5, field_rect.y0 - 2, field_rect.x1 + 5, field_rect.y1 + 2)
                         layer_text = page.get_text("text", clip=layer_rect).strip()
                         
-                        # Valid text criteria: At least 2 characters + contains alpha or digit
                         if layer_text and len(layer_text) >= 2 and any(c.isalnum() for c in layer_text):
-                            # If it contains typical watermark text, treat as blank to force OCR
                             watermark_keywords = ['STATE ELECTION', 'COMMISSION', 'INDIA', 'AVAILABLE']
                             if not any(kw in layer_text.upper() for kw in watermark_keywords):
                                 clean_val = layer_text
@@ -787,18 +809,67 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                         pass
 
                     if not use_layer_text:
-                        # OCR Path
-                        field_pix = page.get_pixmap(clip=field_rect, dpi=400, alpha=False)
-                        crop_img = Image.frombytes("RGB", [field_pix.width, field_pix.height], field_pix.samples)
+                        # MULTI-STAGE RECOVERY: Use full-cell OCR results first (Huge speedup)
+                        # Instead of calling OCR 5 times per voter, we use the results from the 1 full-cell pass
+                        found_in_full = False
                         
-                        # Store image specifically for this field
-                        b64_buffer = io.BytesIO()
-                        crop_img.save(b64_buffer, format='JPEG', quality=85)
-                        additional_fields[f"{field_key}_image"] = base64.b64encode(b64_buffer.getvalue()).decode('utf-8')
+                        if full_text and len(full_text) > 10:
+                            # Identify field from full cell OCR using anchors
+                            if 'name' in key_lower and not any(k in key_lower for k in ['father', 'husband', 'mother', 'other', 'relative']):
+                                name_pat = re.search(r'(?:Name|Nam|Nav|Nam)[:\- .]*([A-Z\s]{3,})', full_text, flags=re.IGNORECASE)
+                                if name_pat:
+                                     clean_val = name_pat.group(1).split('\n')[0].strip()
+                                     if len(clean_val) > 2: found_in_full = True
+                                     
+                            elif 'relation' in key_lower or 'relative' in key_lower:
+                                rel_pat = re.search(r'(?:Husband|Father|Mother|Other|Relative|Pather|S\s*Name|O\s*Name|F\s*Name|H\s*Name)[:\- .]*([A-Z\s:]{3,})', full_text, flags=re.IGNORECASE)
+                                if rel_pat:
+                                     clean_val = rel_pat.group(1).split('\n')[0].strip()
+                                     if len(clean_val) > 2: found_in_full = True
 
-                        field_res = local_ocr_processor.extract_full_cell_text(image=crop_img, force_marathi=False)
-                        raw_text = field_res.get('raw_text', '').strip()
-                        clean_val = field_res.get('text', '').strip()
+                            elif 'age' in key_lower:
+                                age_pat = re.search(r'Age[:\- .]*(\d{1,3})', full_text, flags=re.IGNORECASE)
+                                if age_pat:
+                                     clean_val = age_pat.group(1)
+                                     found_in_full = True
+                            
+                            elif 'gender' in key_lower:
+                                g_val = TranslitHelper.map_gender(full_text)
+                                if g_val:
+                                     clean_val = g_val
+                                     found_in_full = True
+
+                        if not found_in_full:
+                            # FALLBACK: Individual OCR on specific field crop (Slow but precise)
+                            try:
+                                rel_x0 = (field_rect.x0 - cell_full_rect.x0) * px_scale_x
+                                rel_y0 = (field_rect.y0 - cell_full_rect.y0) * px_scale_y
+                                rel_x1 = (field_rect.x1 - cell_full_rect.x0) * px_scale_x
+                                rel_y1 = (field_rect.y1 - cell_full_rect.y0) * px_scale_y
+                                crop_img = master_img.crop((rel_x0, rel_y0, rel_x1, rel_y1))
+                                
+                                field_res = local_ocr_processor.extract_full_cell_text(image=crop_img, force_marathi=False)
+                                raw_text = field_res.get('raw_text', '').strip()
+                                clean_val = field_res.get('text', '').strip()
+                            except Exception as ocr_err:
+                                print(f"      Specific OCR Error: {ocr_err}")
+                                clean_val = ""
+                        else:
+                             # Set a flag or method for tracking
+                             field_res = {'method': 'full_cell_pattern', 'text': clean_val}
+                             raw_text = clean_val
+                             
+                        # Always save crop for UI preview even if we didn't use it for primary OCR
+                        try:
+                            rel_x0 = (field_rect.x0 - cell_full_rect.x0) * px_scale_x
+                            rel_y0 = (field_rect.y0 - cell_full_rect.y0) * px_scale_y
+                            rel_x1 = (field_rect.x1 - cell_full_rect.x0) * px_scale_x
+                            rel_y1 = (field_rect.y1 - cell_full_rect.y0) * px_scale_y
+                            crop_img_ui = master_img.crop((rel_x0, rel_y0, rel_x1, rel_y1))
+                            b64_buffer = io.BytesIO()
+                            crop_img_ui.save(b64_buffer, format='JPEG', quality=70)
+                            additional_fields[f"{field_key}_image"] = base64.b64encode(b64_buffer.getvalue()).decode('utf-8')
+                        except: pass
                     
                     if not clean_val:
                         clean_val = raw_text or ""
@@ -869,7 +940,6 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                                   except: continue
                              
                              # If none in range, just take the first digit sequence found
-                             if not age_val:
                                   age_val = potential_ages[0]
                                   
                         additional_fields['age'] = age_val
@@ -2096,6 +2166,30 @@ def process_page(pdf_path, page_num, config, template, box_detector_config=None)
                                      break
                  except: pass
 
+        # === ULTIMATE SPEEDUP: PAGE-WIDE SPATIAL OCR ===
+        # Instead of OCRing each of the 30 cells independently (which spawns 30+ processes per page)
+        # we OCR the whole page ONCE and use spatial indexing to map text to cells.
+        page_spatial_cache = None
+        if local_ocr_processor:
+            try:
+                # 1. Page-wide Rendering (300 DPI is optimal for spatial mapping)
+                # alpha=False is faster, colorspace=GRAY is much faster
+                print(f"      📄 Spatial Indexing Page {page_num + 1}...")
+                p_pix = page.get_pixmap(dpi=300, colorspace=fitz.csGRAY, alpha=False)
+                p_img = Image.frombytes("L", [p_pix.width, p_pix.height], p_pix.samples)
+                
+                # 2. Get Spatially Indexed Data (One single OCR pass for the whole page!)
+                # Hybrid Mode (oem 1) is fastest for spatial mapping
+                p_data = pytesseract.image_to_data(p_img, output_type=pytesseract.Output.DICT, config='--oem 1 --psm 6')
+                
+                page_spatial_cache = {
+                    'data': p_data,
+                    'scale': (p_pix.width / page.rect.width, p_pix.height / page.rect.height)
+                }
+            except Exception as spatial_init_err:
+                # print(f"Spatial Init Error: {spatial_init_err}")
+                pass
+
         # Process Cells
         for cell_info in cells_to_process:
             result = _extract_cell_internal(
@@ -2106,7 +2200,8 @@ def process_page(pdf_path, page_num, config, template, box_detector_config=None)
                 extraction_limits=extraction_limits, 
                 processors=processors,
                 master_page_img=master_page_img,
-                master_page_scale=master_page_scale
+                master_page_scale=master_page_scale,
+                page_spatial_cache=page_spatial_cache
             )
             
             if result and not result.get('skipped'):

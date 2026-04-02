@@ -40,20 +40,22 @@ class PaddleOCRProcessor:
         
         if PADDLE_AVAILABLE:
             try:
-                # Initialize PaddleOCR
-                # use_angle_cls=True to correct rotation
-                # lang=self.lang to specify Marathi/Devanagari model
-                # Silent initialization (verbose suppressed via environment variables)
+                # DETECT GPU: Check if CUDA is available for massive speedup
                 try:
-                    self.ocr = PaddleOCR(
-                        use_angle_cls=True, 
-                        lang=self.lang, 
-                        show_log=False,
-                        use_gpu=False  # Use CPU for better compatibility
-                    )
-                except (TypeError, ValueError):
-                    # Fallback if show_log not supported
-                    self.ocr = PaddleOCR(use_angle_cls=True, lang=self.lang, use_gpu=False)
+                    import paddle
+                    use_gpu = paddle.device.is_compiled_with_cuda()
+                except:
+                    use_gpu = False
+                
+                print(f"Initializing PaddleOCR (GPU={'ENABLED' if use_gpu else 'DISABLED'})...")
+
+                # Initialize PaddleOCR
+                self.ocr = PaddleOCR(
+                    use_angle_cls=True, 
+                    lang=self.lang, 
+                    show_log=False,
+                    use_gpu=use_gpu
+                )
             except Exception as e:
                 print(f"Error initializing PaddleOCR: {str(e)}")
         else:
