@@ -56,46 +56,75 @@ class TranslitHelper:
     def translate_to_kannada(text):
         """
         Translate English text to Kannada using Google Translator.
+        Includes retry logic for robustness.
         """
-        if not text or len(text.strip()) < 2:
+        if not text or len(str(text).strip()) < 2:
             return ""
+        
+        text = str(text).strip()
         try:
             # Check cache
             cache_key = f"en_kn_{text}"
             if cache_key in TranslitHelper._translit_cache:
                 return TranslitHelper._translit_cache[cache_key]
             
-            result = TranslitHelper._kannada_translator.translate(text)
-            TranslitHelper._translit_cache[cache_key] = result
-            return result
+            # Implementation with retry
+            import time
+            last_err = None
+            for attempt in range(3):
+                try:
+                    result = TranslitHelper._kannada_translator.translate(text)
+                    if result:
+                        TranslitHelper._translit_cache[cache_key] = result
+                        return result
+                except Exception as e:
+                    last_err = e
+                    time.sleep(0.5 * (attempt + 1))
+            
+            # Fallback: if translation fails repeatedly, return the English text
+            # This prevents data from being "skipped" entirely
+            return text
         except:
-            return ""
+            return text # Absolute fallback to English
 
     @staticmethod
     def map_gender(text):
+        """
+        Aggressive Gender mapping for messy OCR results.
+        Includes common misreads: Ml, Mo, MM, iF, an, etc.
+        """
         if not text:
             return ""
+        
         t = str(text).strip().upper()
+        # Remove common noise
+        t = re.sub(r'[^A-Z]', ' ', t)
+        t = ' '.join(t.split())
         
-        # 1. Direct priority matches
-        if any(k in t for k in ['FEMALE', 'STRI', 'RENALE', 'FE ']):
-             return "Female"
-        if any(k in t for k in ['MALE', 'PURUSH', 'NALE', 'PIALE']):
+        # 1. Direct Keyword Matches (Highest Priority)
+        if any(k in t for k in ['FEMALE', 'STRI', 'RENALE']): return "Female"
+        if any(k in t for k in ['MALE', 'PURUSH', 'NALE']):
+             if 'FEMALE' in t: return "Female"
              return "Male"
-             
-        # 2. Strict character matches
-        if t in ['M', 'M.', 'MALE']: return "Male"
-        if t in ['F', 'F.', 'FEMALE']: return "Female"
 
-        # 3. Fuzzy matches for common OCR misreads
-        if t.startswith('M') or t.endswith('M') or 'MAL' in t: return "Male"
-        if t.startswith('F') or t.endswith('F') or 'FEM' in t: return "Female"
+        # 2. Misread patterns - Female
+        # iF, an (STRI misread?), ST, FE, EMA, LEN
+        if any(k in t for k in [' FE', 'FE ', ' IF', 'IF ', 'STRI', 'ST ', ' AN ', 'ENALE']):
+             return "Female"
+        if t.startswith('F') or t.endswith('F') or t == 'F': return "Female"
+
+        # 3. Misread patterns - Male
+        # Ml, Mo, MM, MA, PIALE
+        if any(k in t for k in ['ML', 'MO', 'MM', 'MA ', ' MA', 'PIALE', 'NALE']):
+             if 'EMA' in t: return "Female" # avoid fEMALE
+             return "Male"
+        if t.startswith('M') or t.endswith('M') or t == 'M': 
+             if t.startswith('FEM'): return "Female"
+             return "Male"
         
-        # 4. Handle very messy OCR (e.g. 'hl', 'H1', 'i1', 'li')
-        # If it starts with h, l, i, etc it might be M/F? No, let's keep it safe.
-        # But commonly 'M' is read as 'H' or 'N'.
-        if any(k in t for k in ['PU', 'PUR', 'NAT', 'NAL']): return "Male"
-        if any(k in t for k in ['MAH', 'STRI', 'W ']): return "Female"
+        # 4. Final Fuzzy Substrings
+        if 'FEM' in t or 'STR' in t: return "Female"
+        if 'MAL' in t or 'PUR' in t: return "Male"
         
         return ""
 
@@ -123,11 +152,22 @@ class TranslitHelper:
         if not text:
             return ""
         
-        # 1. Basic OCR cleanup
-        text = text.replace('||', '').replace('|', '').replace(':', '')
+        # 1. Colon splitting fallback (User: "only data after colon")
+        if ':' in text:
+            text = text.rsplit(':', 1)[-1].strip()
+        
+        # 2. NEW ANCHOR STRIPPING: Remove everything UP TO "Name" label (User requested)
+        # This handles cases like "Ausband S Name Surel Armed" -> "Surel Armed"
+        name_anchor = re.search(r'\b(Name|Nam|Nav|Nan|Nom|Narn|Nim|Naro|Nare)\b', text, flags=re.IGNORECASE)
+        if name_anchor:
+            text = text[name_anchor.end():].strip()
+
+        # 1.1 Basic OCR cleanup
+        text = text.replace('||', '').replace('|', '')
         
         # 2. Remove common English labels and OCR artifacts (like Photo indicators)
-        labels_pattern = r'^(?:Father|Husband|Mother|Relative|Other|Name|Nam|Nav|Nam|Phoate|Photo|Pnote|Pinoie|Fnote|Cnoto|Polo|Pnale|Not|Nat)\'?\s*s?\s*(?:Name|Nav|Nam|Not|Available)?\s*(?:is)?\s*[:\-\.\|\\/ ]*'
+        # Added common misreads: Falher, Fusband, Fusbanda, Pinoie, Pnote, Cnoto, Polo
+        labels_pattern = r'^(?:Father|Husband|Mother|Relative|Other|Name|Nam|Nav|Nam|Phoate|Photo|Pnote|Pinoie|Fnote|Cnoto|Polo|Pnale|Not|Nat|Falher|Fusband|Fusbanda|Pinoie|Pnote|Cnoto|Polo|Pnale|Not|Nat)\'?\s*s?\s*(?:Name|Nav|Nam|Not|Available)?\s*(?:is)?\s*[:\-\.\|\\/ ]*'
         text = re.sub(labels_pattern, '', text, flags=re.IGNORECASE).strip()
         
         # 2.1 Specific junk removals for common bleeding text
@@ -138,14 +178,33 @@ class TranslitHelper:
         for jp in junk_patterns:
              text = re.sub(jp, '', text, flags=re.IGNORECASE).strip()
         
+        # 2.2 Watermark removal
+        watermark_patterns = [
+            r'STATE\s+ELECTION\s+COMMISSION',
+            r'ELECTION\s+COMMISSION\s+OF\s+INDIA',
+            r'ELECTION\s+COMMISSION',
+            r'STATE\s+ELECTION',
+            r'COMMISSION',
+            r'ELECTION',
+            r'INDIA'
+        ]
+        for wp in watermark_patterns:
+            text = re.sub(wp, '', text, flags=re.IGNORECASE).strip()
+        
         # 3. Strictly keep only English letters and spaces
         text = re.sub(r'[^a-zA-Z\s]', ' ', text)
         
         # 4. Normalize whitespace and capitalize
         text = ' '.join(word.capitalize() for word in text.split()).strip()
         
-        # 5. Remove single character noise at start/end
-        text = re.sub(r'^[a-z]\s+', '', text, flags=re.IGNORECASE).strip()
+        # 5. Remove leading/trailing junk artifacts (like "Gh Ee I", "Rie Rad")
+        # Removes leading fragments of 1-3 letters that look like OCR noise
+        text = re.sub(r'^(?:[a-z]{1,2}|v|vi|vii|viii|ix|x)\s+', '', text, flags=re.IGNORECASE).strip()
+        text = re.sub(r'^(?:Gh|Ee|Ii|Oo|Aa|Ai|Au)\s+', '', text, flags=re.IGNORECASE).strip()
+        
+        # 6. Final cleanup: eliminate lone single characters resulting from sanitization
+        if len(text) <= 2 and not text.isalpha():
+            return ""
         
         return text
 

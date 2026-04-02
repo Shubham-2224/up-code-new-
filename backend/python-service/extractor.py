@@ -652,8 +652,7 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
         print(f"         Voter ID Confidence: {voter_id_confidence:.2f}")
         print(f"         Has Photo: {bool(photo_base64 and len(photo_base64) > 0)}")
         
-        # Skip logic - NEVER SKIP DATA (User Request)
-        # Ensure ALL data is extracted, even if Voter ID is missing.
+        # Skip logic - Initialized to False (Check mandatory fields at the end)
         should_skip = False
         skip_reason = ""
         
@@ -667,21 +666,13 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
              print(f"         ✓ Voter ID found: '{voter_id_text}'")
         else:
              print(f"         ✗ No valid voter ID found")
-             # Keep whatever text we have (even if truncated)
              if not voter_id_text:
                  voter_id_text = ""
         
-        # LOGIC: NEVER skip data if it's part of the grid. 
-        # The user wants "No cell is gonna be empty" (Every grid cell should have a row)
-        should_skip = False
-        
-        # Log the final decision
+        # Log the decision to proceed with full extraction for evaluation
         voter_id_display = voter_id_text[:20] if voter_id_text else "[No ID]"
         photo_status = "Yes" if has_photo else "No"
-        print(f"      ✅ FORCE EXTRACT Page {page_num+1}, Row {row+1}, Col {col+1}: VoterID='{voter_id_display}', Photo={photo_status}")
-        
-        if should_skip:
-            return {'skipped': True, 'stats': cell_stats}
+        print(f"      📝 Evaluating Page {page_num+1}, Row {row+1}, Col {col+1}: VoterID='{voter_id_display}', Photo={photo_status}")
         
         # === EXTRACT FULL MARATHI TEXT ===
         # Try to get text from PDF text layer first (for digital PDFs)
@@ -771,26 +762,36 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                     else:
                         field_rect = fitz.Rect(cell_x + f_x, cell_y + f_y, cell_x + f_x + f_w, cell_y + f_y + f_h)
                     
-                    # Try Text Layer First for speed
-                    layer_text = ""
+                    # Strategy for High Speed & Accuracy: Robust Digital Text Extraction
                     use_layer_text = False
-                    try: 
-                        layer_text = page.get_text("text", clip=field_rect).strip()
-                        # If digital text exists and looks like English, use it!
-                        if layer_text and any(c.isalpha() for c in layer_text):
-                             if len(layer_text) > 2: # Trust substantial text
-                                 use_layer_text = True
-                    except: pass
+                    # Initialize defaults to avoid UnboundLocalError
+                    clean_val = ""
+                    raw_text = ""
+                    field_res = {}
+
+                    try:
+                        # Use a slightly expanded rect for text layer to catch cutoff names
+                        layer_rect = fitz.Rect(field_rect.x0 - 5, field_rect.y0 - 2, field_rect.x1 + 5, field_rect.y1 + 2)
+                        layer_text = page.get_text("text", clip=layer_rect).strip()
                         
-                    if use_layer_text:
-                        clean_val = layer_text
-                        raw_text = layer_text
-                        field_res = {'method': 'text_layer', 'text': layer_text, 'raw_text': layer_text}
-                    else:
+                        # Valid text criteria: At least 2 characters + contains alpha or digit
+                        if layer_text and len(layer_text) >= 2 and any(c.isalnum() for c in layer_text):
+                            # If it contains typical watermark text, treat as blank to force OCR
+                            watermark_keywords = ['STATE ELECTION', 'COMMISSION', 'INDIA', 'AVAILABLE']
+                            if not any(kw in layer_text.upper() for kw in watermark_keywords):
+                                clean_val = layer_text
+                                raw_text = layer_text
+                                field_res = {'method': 'text_layer', 'text': layer_text, 'raw_text': layer_text}
+                                use_layer_text = True
+                    except:
+                        pass
+
+                    if not use_layer_text:
+                        # OCR Path
                         field_pix = page.get_pixmap(clip=field_rect, dpi=400, alpha=False)
                         crop_img = Image.frombytes("RGB", [field_pix.width, field_pix.height], field_pix.samples)
                         
-                        # Store image
+                        # Store image specifically for this field
                         b64_buffer = io.BytesIO()
                         crop_img.save(b64_buffer, format='JPEG', quality=85)
                         additional_fields[f"{field_key}_image"] = base64.b64encode(b64_buffer.getvalue()).decode('utf-8')
@@ -798,19 +799,44 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                         field_res = local_ocr_processor.extract_full_cell_text(image=crop_img, force_marathi=False)
                         raw_text = field_res.get('raw_text', '').strip()
                         clean_val = field_res.get('text', '').strip()
-                        if not clean_val:
-                            clean_val = raw_text
+                    
+                    if not clean_val:
+                        clean_val = raw_text or ""
                                   # === FIELD CLEANING ===
                     if 'name' in key_lower:
                         is_rel = 'relative' in key_lower
-                        clean_val = TranslitHelper.sanitize_name(clean_val, is_relative=is_rel)
                         
                         if is_rel:
-                            additional_fields['relativeName'] = clean_val
-                            additional_fields['relativeNameEnglish'] = clean_val
-                            additional_fields['relativeNameKannada'] = TranslitHelper.translate_to_kannada(clean_val)
-                            additional_fields['relationType'] = TranslitHelper.map_relation_type(raw_text)
+                            # 1. ENHANCED RELATIVE NAME EXTRACTION: Split by Colon (User Requested)
+                            curr_val = clean_val if clean_val else raw_text
+                            
+                            if ':' in curr_val:
+                                # Use the LAST colon to ensure we only get the actual Name (User Requested)
+                                parts = curr_val.rsplit(':', 1)
+                                rel_type_part = parts[0].strip()
+                                name_part = parts[1].strip()
+                                
+                                # Sanitize only the name part
+                                finalized_name = TranslitHelper.sanitize_name(name_part, is_relative=True)
+                                
+                                additional_fields['relativeName'] = finalized_name
+                                additional_fields['relativeNameEnglish'] = finalized_name
+                                additional_fields['relativeNameKannada'] = TranslitHelper.translate_to_kannada(finalized_name)
+                                
+                                # Strictly map to H, F, M, O based on the part before colon
+                                additional_fields['relationType'] = TranslitHelper.map_relation_type(rel_type_part)
+                            else:
+                                # Standard Fallback
+                                clean_val = TranslitHelper.sanitize_name(clean_val, is_relative=True)
+                                additional_fields['relativeName'] = clean_val
+                                additional_fields['relativeNameEnglish'] = clean_val
+                                additional_fields['relativeNameKannada'] = TranslitHelper.translate_to_kannada(clean_val)
+                                # Try to get relation type from full text
+                                additional_fields['relationType'] = TranslitHelper.map_relation_type(raw_text)
+                        
                         else:
+                            # Primary Name
+                            clean_val = TranslitHelper.sanitize_name(clean_val, is_relative=False)
                             additional_fields['name'] = clean_val
                             additional_fields['nameEnglish'] = clean_val
                             additional_fields['nameKannada'] = TranslitHelper.translate_to_kannada(clean_val)
@@ -820,22 +846,39 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                         val = clean_val.strip().upper()
                         val = val.replace('O', '0').replace('U', '0').replace('I', '1').replace('L', '1').replace('B', '8').replace('S', '5')
                         
-                        digits = re.sub(r'[^0-9]', '', val)
-                        if not digits:
+                        # Use regex to find all sequences of digits (User wants integer only)
+                        potential_ages = re.findall(r'\d+', val)
+                        if not potential_ages:
                              # Try raw text as fallback
-                             val_raw = raw_text.strip().upper()
-                             val_raw = val_raw.replace('O', '0').replace('U', '0').replace('I', '1').replace('L', '1')
-                             digits = re.sub(r'[^0-9]', '', val_raw)
+                             val_raw = raw_text.strip().upper().replace('O', '0').replace('I', '1')
+                             potential_ages = re.findall(r'\d+', val_raw)
                              
-                        if not digits:
-                            digits = re.sub(r'[^0-9]', '', page.get_text("text", clip=field_rect))
+                        if not potential_ages:
+                             # Text layer fallback
+                             potential_ages = re.findall(r'\d+', page.get_text("text", clip=field_rect))
                         
-                        age_val = digits if (digits and 0 < int(digits) < 125) else ""
+                        # Find the most plausible age integer
+                        age_val = ""
+                        if potential_ages:
+                             for p in potential_ages:
+                                  try:
+                                       val_int = int(p)
+                                       if 18 <= val_int <= 120:
+                                            age_val = p
+                                            break
+                                  except: continue
+                             
+                             # If none in range, just take the first digit sequence found
+                             if not age_val:
+                                  age_val = potential_ages[0]
+                                  
                         additional_fields['age'] = age_val
 
                     elif 'gender' in key_lower:
+                        # Use enhanced map_gender which handles F/M shortcuts
                         g = TranslitHelper.map_gender(clean_val)
                         if not g: g = TranslitHelper.map_gender(raw_text)
+                        
                         additional_fields['gender'] = g
                         additional_fields['genderEnglish'] = g
                         additional_fields['genderKannada'] = TranslitHelper.translate_to_kannada(g)
@@ -851,13 +894,25 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                             additional_fields['boothCenterEnglish'] = clean_val
                             additional_fields['boothCenterKannada'] = TranslitHelper.translate_to_kannada(clean_val)
 
+                    elif 'relation' in key_lower:
+                        # 1. Specialized relation type extraction
+                        curr_rel = clean_val if clean_val else raw_text
+                        rt_to_map = curr_rel.split(':', 1)[0].strip() if ':' in curr_rel else curr_rel
+                        additional_fields['relationType'] = TranslitHelper.map_relation_type(rt_to_map)
+
                     elif 'house' in key_lower:
-                        additional_fields['houseNo'] = re.sub(r'^(?:HOUSE|H\.?\s*NO|HS|NO|NUM|H)\b[:\- .]*', '', clean_val, flags=re.IGNORECASE).strip()
+                        # 1. Strip common prefixes
+                        val = re.sub(r'^(?:HOUSE|H\.?\s*NO|HS|NO|NUM|H)\b[:\- .]*', '', clean_val, flags=re.IGNORECASE).strip()
+                        # 2. Strictly keep only Alphanumeric, spaces, / and - (User: "strictly avoid special characters")
+                        # This removes things like #, $, *, _, |, !, etc.
+                        val = re.sub(r'[^a-zA-Z0-9\s\/\-]', ' ', val)
+                        additional_fields['houseNo'] = ' '.join(val.split()).strip()
 
                     elif any(k in key_lower for k in ['serial', 'assembly', 'ac', 'pc', 'part']):
                         num_val = re.sub(r'[^0-9/,\-]', '', clean_val)
                         if 'serial' in key_lower:
-                            additional_fields['serialNo'] = re.sub(r'[^0-9,]', '', num_val)
+                            # User wants to add serial numbers manually, so keep it blank
+                            additional_fields['serialNo'] = ""
                         elif any(k in key_lower for k in ['assembly', 'ac']):
                             additional_fields['assemblyNo'] = num_val
                         else:
@@ -866,7 +921,9 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                     if field_key not in additional_fields:
                         additional_fields[field_key] = clean_val
 
-                    print(f"         > {field_key}: {clean_val}")
+                    # Update clean_val for logging so it shows the sanitized/mapped value
+                    log_val = additional_fields.get(field_key, clean_val)
+                    print(f"         > {field_key}: {log_val}")
                 except Exception as ex:
                     print(f"         > {field_key}: Error ({str(ex)})")
         
@@ -896,6 +953,50 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                         additional_fields['relativeNameEnglish'] = rel_name
                         additional_fields['relativeNameKannada'] = TranslitHelper.translate_to_kannada(rel_name)
                         break
+
+        # === SMART FALLBACK (AGE & GENDER) ===
+        # If Age or Gender are missing, scan the entire cell's full_text for recovery
+        if full_text and (not additional_fields.get('age') or not additional_fields.get('gender')):
+             lines = [l.strip() for l in full_text.split('\n') if l.strip()]
+             for line in lines:
+                  # 1. Recover Age from full text
+                  if not additional_fields.get('age') and 'age' in line.lower():
+                       matches = re.findall(r'\d+', line)
+                       for m in matches:
+                            try:
+                                 val_int = int(m)
+                                 if 18 <= val_int <= 120:
+                                      additional_fields['age'] = m
+                                      break
+                            except: continue
+                  
+                  # 2. Recover Gender from full text
+                  if not additional_fields.get('gender'):
+                       g = TranslitHelper.map_gender(line)
+                       if g:
+                            additional_fields['gender'] = g
+                            additional_fields['genderEnglish'] = g
+                            additional_fields['genderKannada'] = TranslitHelper.translate_to_kannada(g)
+
+        # === USER REQUEST: Mandatory Fields Filter ===
+        # ONLY take if Voter ID, Name, and Relative Name are present
+        name_val = additional_fields.get('nameEnglish', '').strip()
+        rel_name_val = additional_fields.get('relativeNameEnglish', '').strip()
+        
+        # Voter ID is considered valid if it's at least 5 chars (loose) or matches pattern
+        # Here we use 5 chars as the minimum threshold for presence
+        has_id = bool(voter_id_text and len(voter_id_text.strip()) >= 5)
+        has_name = bool(name_val and len(name_val) >= 2)
+        has_relative = bool(rel_name_val and len(rel_name_val) >= 2)
+        
+        if not (has_id and has_name and has_relative):
+            should_skip = True
+            reasons = []
+            if not has_id: reasons.append("VoterID")
+            if not has_name: reasons.append("Name")
+            if not has_relative: reasons.append("RelativeName")
+            skip_reason = f"Missing: {', '.join(reasons)}"
+            print(f"      ⏭️  SKIPPING Page {page_num+1}, Row {row+1}, Col {col+1}: {skip_reason}")
 
         # Return result
         result = {
@@ -930,9 +1031,10 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                 'voter_id_confidence': voter_id_confidence,
                 'photo_quality': photo_quality,
                 'text_method': text_method,
+                'skip_reason': skip_reason
             },
             'stats': cell_stats,
-            'skipped': False
+            'skipped': should_skip
         }
         return result
         
